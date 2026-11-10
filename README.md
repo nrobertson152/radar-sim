@@ -15,6 +15,26 @@ pip install -r requirements.txt
 python run.py
 ```
 
+## Linux AppImage
+
+A Linux x86_64 AppImage is built automatically on pushes to `main`, version
+tags, and pull requests. You can also start a build manually from the
+[Build Linux AppImage workflow](https://github.com/nrobertson152/radar-sim/actions/workflows/appimage.yml).
+
+To download a build, open a successful workflow run, then download the
+**RADAR-SIM-linux-x86_64** artifact under **Artifacts**. Unzip it and run:
+
+```bash
+chmod +x RADAR-SIM-x86_64.AppImage
+./RADAR-SIM-x86_64.AppImage
+```
+
+The artifact also includes a SHA-256 checksum. The AppImage bundles Python and
+the application's pip dependencies; you do not need to install them separately.
+If your system lacks the FUSE library required by the AppImage runtime, launch
+it with `APPIMAGE_EXTRACT_AND_RUN=1 ./RADAR-SIM-x86_64.AppImage`.
+Workflow artifacts are retained for 30 days.
+
 Python 3.9+. `pygame-ce` is recommended; classic `pygame` 2.x also works.
 The window is 1600x900 and scales when resized (F11 = full screen).
 All sound is synthesised live - there are no asset files.
