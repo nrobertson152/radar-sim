@@ -1,0 +1,130 @@
+name: Build Linux AppImage
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  appimage:
+    name: Build and smoke-test AppImage (x86_64)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt "pyinstaller>=6.10,<7"
+
+      - name: Run source smoke tests
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: |
+          python tests/test_input.py
+          python run.py --selftest "$RUNNER_TEMP/source-shots"
+
+      - name: Freeze executable using PyInstaller
+        run: |
+          pyinstaller --noconfirm --clean --onedir \
+            --name RADAR-SIM \
+            --collect-all pygame \
+            run.py
+          test -x dist/RADAR-SIM/RADAR-SIM
+
+      - name: Assemble AppDir
+        run: |
+          mkdir -p AppDir/usr/lib/RADAR-SIM
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+          cp -a dist/RADAR-SIM/. AppDir/usr/lib/RADAR-SIM/
+
+          cat > AppDir/AppRun <<'EOF'
+          #!/bin/sh
+          APPDIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+          exec "$APPDIR/usr/lib/RADAR-SIM/RADAR-SIM" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+
+          cat > AppDir/radar-sim.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=RADAR-SIM
+          Comment=Radar, radio and GMDSS console trainer
+          Exec=RADAR-SIM
+          Icon=radar-sim
+          Categories=Education;Science;
+          Terminal=false
+          EOF
+          cp AppDir/radar-sim.desktop AppDir/usr/share/applications/
+
+          # Create a square radar-themed icon using the installed pygame package.
+          SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python - <<'PY'
+          import math
+          import pygame
+
+          pygame.init()
+          icon = pygame.Surface((256, 256), pygame.SRCALPHA)
+          icon.fill((12, 23, 27, 255))
+          center = (128, 128)
+          for radius in (42, 78, 110):
+              pygame.draw.circle(icon, (39, 105, 86), center, radius, 2)
+          pygame.draw.line(icon, (39, 105, 86), (18, 128), (238, 128), 2)
+          pygame.draw.line(icon, (39, 105, 86), (128, 18), (128, 238), 2)
+          end = (128 + int(110 * math.cos(-0.7)),
+                 128 + int(110 * math.sin(-0.7)))
+          pygame.draw.line(icon, (87, 235, 167), center, end, 5)
+          for point in ((83, 91), (180, 150), (112, 191)):
+              pygame.draw.circle(icon, (159, 255, 207), point, 7)
+          pygame.image.save(icon, "AppDir/radar-sim.png")
+          pygame.quit()
+          PY
+          cp AppDir/radar-sim.png AppDir/usr/share/icons/hicolor/256x256/apps/
+
+      - name: Build AppImage
+        run: |
+          curl --fail --location --retry 3 \
+            -o appimagetool-x86_64.AppImage \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+
+          # Extract the packaging tool to avoid relying on FUSE on CI runners.
+          ./appimagetool-x86_64.AppImage --appimage-extract > /dev/null
+          ARCH=x86_64 ./squashfs-root/AppRun AppDir RADAR-SIM-x86_64.AppImage
+          chmod +x RADAR-SIM-x86_64.AppImage
+
+      - name: Smoke-test final AppImage
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          ./RADAR-SIM-x86_64.AppImage --selftest "$RUNNER_TEMP/appimage-shots"
+          test "$(find "$RUNNER_TEMP/appimage-shots" -maxdepth 1 -type f -name '*.png' | wc -l)" -eq 8
+          sha256sum RADAR-SIM-x86_64.AppImage > RADAR-SIM-x86_64.AppImage.sha256
+
+      - name: Upload downloadable AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: RADAR-SIM-linux-x86_64
+          path: |
+            RADAR-SIM-x86_64.AppImage
+            RADAR-SIM-x86_64.AppImage.sha256
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
