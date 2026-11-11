@@ -5,7 +5,7 @@ terminal with distress alerting and EGC SafetyNET reception.
 """
 import math
 import pygame
-from . import ui
+from . import ui, fx
 from .ui import C, text, Knob, Selector, Button, Guard, Station
 from .world import INMARSAT, geo_look, fmt_lat, fmt_lon, wrap180
 from .worldmap import WorldMap
@@ -38,6 +38,8 @@ class Satcom(Station):
         super().__init__(app)
         self.map = WorldMap((30, 80, 880, 440))
         self.mon = Monitor()
+        self.mon.snd = "printer"
+        self._slew, self._lastp = 0.0, (90.0, 45.0)
         self.flags, self.pending = {}, []
         self.cn0, self.err, self.blocked = 0.0, 99.0, False
         self.tracking = False
@@ -74,7 +76,7 @@ class Satcom(Station):
             "hold 3 s. Sends identity, position, course, speed and nature via the LES straight to an MRCC with top priority."))
         self.nature = self.add(Selector(1160, 506, 22, "NATURE", NATURES, 0, "Nature of distress included in the alert."))
         self.keys = ui.keypad(self, 1440, 436, [["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"], ["*", "0", "#"]],
-                              40, 25, 4, "Fleet voice handset. Two-digit safety codes: 32 medical advice, 38 medical "
+                              40, 25, 4, snd="dtmf", tip="Fleet voice handset. Two-digit safety codes: 32 medical advice, 38 medical "
                               "assistance, 39 maritime assistance, 41 met reports, 42 navigational hazards. Dial then CALL.")
         self.b_call = self.add(Button((1300, 482, 62, 34), "CALL", "Place the voice call through the directional antenna.", color="green"))
         self.b_end = self.add(Button((1368, 482, 62, 34), "END", "Clear the call / the dialled digits.", color="red"))
@@ -126,6 +128,8 @@ class Satcom(Station):
                 self.pending.remove(item)
                 item[1]()
         az, el, slant = self.look()
+        if (self.az.val, self.el.val) != self._lastp:
+            self._lastp, self._slew = (self.az.val, self.el.val), w.t + 0.25
         if self.region.value != getattr(self, "_reg", None):
             self._reg = self.region.value
             if self.logged:
@@ -166,6 +170,7 @@ class Satcom(Station):
             else:
                 reg = self.sat[0]
                 self.busy = ("SEARCHING NCS COMMON CHANNEL", w.t, 3.5)
+                ui.sfx("login")
 
                 def done():
                     self.busy, self.logged = None, reg
@@ -188,6 +193,7 @@ class Satcom(Station):
             else:
                 body, les = self.msg, self.les.label
                 self.busy = ("TRANSMITTING TO " + les, w.t, 4.0)
+                ui.sfx("data")
 
                 def sent():
                     self.busy = None
@@ -220,11 +226,13 @@ class Satcom(Station):
             else:
                 num = self.dial.rstrip("#")
                 self.call = "DIALLING"
+                ui.sfx("ring")
 
                 def conn():
                     if self.call is None:
                         return
                     self.call = "CONNECTED"
+                    ui.sfx("connect")
                     self.flags["call:" + num] = w.t
                     if num in SAC:
                         self.mon.note("%s  VOICE  CODE %s  %s" % (w.utc_str(), num, SAC[num][0]), SAC[num][1], C["cyan"])
@@ -243,6 +251,7 @@ class Satcom(Station):
         nat, les = self.nature.value, self.les.label
         self.distress = dict(t0=w.t, acked=False)
         self.flags["c_distress"] = w.t
+        ui.sfx("data")
         self.mon.note("%s  DISTRESS ALERT TRANSMITTED" % w.utc_str(),
                       "TO %s  MES 4%d  POS %s %s  UTC %s  CSE %03d SPD %d  NATURE: %s" %
                       (les, w.mmsi // 10, fmt_lat(w.lat), fmt_lon(w.lon), w.utc_str()[:5], w.hdg, w.spd, nat), C["red"])
@@ -257,10 +266,13 @@ class Satcom(Station):
         self.after(6, ack)
 
     def bg_audio(self, syn, n):
+        out = None
+        if self.world.t < self._slew and self.app.station is self:          # antenna drive motors
+            out = syn.osc("dish", 210.0, n) * 0.02 + syn.rumble("dishn", n, 8) * 0.07
         d = self.distress
         if d and d["acked"] and self.world.t - d["t0"] < 9:
-            return syn.beep("satb", n, 1500.0, 5.0) * 0.3
-        return None
+            out = (0 if out is None else out) + syn.beep("satb", n, 1500.0, 5.0) * 0.3
+        return out
 
     # ----------------------------------------------------------------- draw
     def tip_at(self, pos):
@@ -283,6 +295,7 @@ class Satcom(Station):
         ui.panel(s, (20, 532, 900, 328), "FLEET ABOVE-DECK ANTENNA  -  POINTING")
         ui.panel(s, (930, 54, 660, 500), "INMARSAT-C TERMINAL  (L-BAND  TX 1626.5-1646.5  RX 1530-1545 MHz)   |   FLEET HANDSET")
         ui.panel(s, (930, 562, 660, 298), "PRINTER / EVENT LOG")
+        ui.crt(s, self.map.rect, gain=80)
         self.map.draw(s)
         cols = [(255, 120, 90), (255, 200, 70), (110, 220, 255), (190, 140, 255)]
         for i, (nm, lon) in enumerate(INMARSAT):
@@ -324,6 +337,11 @@ class Satcom(Station):
         pygame.draw.circle(s, col, p, 9, 2)
         pygame.draw.line(s, col, (p[0] - 13, p[1]), (p[0] + 13, p[1]), 1)
         pygame.draw.line(s, col, (p[0], p[1] - 13), (p[0], p[1] + 13), 1)
+        mult, add = fx.round_glass(R)
+        s.blit(mult, (cx - R, cy - R), special_flags=pygame.BLEND_RGB_MULT)
+        s.blit(add, (cx - R, cy - R), special_flags=pygame.BLEND_RGB_ADD)
+        pygame.draw.circle(s, (14, 15, 17), (cx, cy), R + 4, 5)
+        pygame.draw.circle(s, (86, 90, 96), (cx, cy), R + 6, 1)
         text(s, "30°", (cx + 3, cy - R * 2 // 3 - 1), 8, C["dim"])
         text(s, "60°", (cx + 3, cy - R // 3 - 1), 8, C["dim"])
         # signal + data

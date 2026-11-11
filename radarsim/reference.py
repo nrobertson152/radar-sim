@@ -186,22 +186,24 @@ class Reference(Station):
         for i, b in enumerate(self.btns):
             if b.pop():
                 self.page = i
+                ui.sfx("page")
             b.on = i == self.page
 
     def draw(self, s):
         ui.panel(s, (20, 54, 240, 806), "PAGES")
         ui.panel(s, (270, 54, 1320, 806), PAGES[self.page][0])
-        x, y, col = 292, 84, 0
+        ui.crt(s, (286, 80, 1288, 766), (4, 9, 7))
+        x, y, col = 300, 92, 0
         for head, body in PAGES[self.page][1]:
             lines = body.split("\n")
             need = 26 + len(lines) * 17 + 16
             if y + need > 850 and col == 0:
-                col, x, y = 1, 950, 84
+                col, x, y = 1, 950, 92
             text(s, head, (x, y), 13, C["amber"], bold=True)
-            pygame.draw.line(s, C["edge"], (x, y + 19), (x + 620, y + 19), 1)
+            pygame.draw.line(s, (40, 90, 60), (x, y + 19), (x + 600, y + 19), 1)
             y += 26
             for ln in lines:
-                text(s, ln, (x, y), 12, C["text"])
+                text(s, ln, (x, y), 12, C["lcdfg"])
                 y += 17
             y += 16
         ui.text_block(s, "KEYS\nF1-F8  stations\nF10  mute\nF11  full screen\nSPACE  push-to-talk\nWheel / drag  knobs\nSHIFT  fine adjust\n \nThis is a training aid with simplified physics. Always follow "

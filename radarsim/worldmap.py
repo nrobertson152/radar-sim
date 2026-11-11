@@ -82,7 +82,6 @@ class WorldMap:
 
     def draw(self, s):
         s.blit(self.base, self.rect)
-        pygame.draw.rect(s, C["edge"], self.rect, 1)
 
     def footprint(self, s, lat, lon, ang, color, step=4, size=1):
         """Dotted circle of angular radius `ang` degrees around a sub-point."""

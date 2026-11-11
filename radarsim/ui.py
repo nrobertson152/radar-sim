@@ -5,6 +5,7 @@ the window scaling), so all coordinates in the stations are absolute pixels.
 """
 import math
 import pygame
+from . import fx
 
 W, H = 1600, 900
 TOP, BOT = 46, 866          # station area is between the tab bar and status bar
@@ -89,80 +90,115 @@ def text_block(s, msg, rect, size=13, color=None, lh=None, mono=True, bold=False
     return y
 
 
+GLASS = []                  # display faces drawn this frame, glazed in finish()
+SFX = None                  # set by the app: callable(name, volume)
+
+
+def sfx(name, vol=1.0):
+    if SFX:
+        SFX(name, vol)
+
+
+def legend(s, msg, pos, size=10, color=(196, 200, 204), align="c", bold=True, mono=True):
+    """Silk-screened panel legend (light paint with a hair of shadow)."""
+    text(s, msg, (pos[0] + 1, pos[1] + 1), size, (8, 9, 10), bold, align, mono)
+    return text(s, msg, pos, size, color, bold, align, mono)
+
+
 def panel(s, rect, title=None, color=None):
+    """A wrinkle-painted steel plate screwed to the console, with an
+    engraved label plate for its title."""
     r = pygame.Rect(rect)
-    pygame.draw.rect(s, color or C["panel"], r, border_radius=7)
-    pygame.draw.rect(s, C["edge"], r, 1, border_radius=7)
-    for x, y in ((r.x + 7, r.y + 7), (r.right - 8, r.y + 7),
-                 (r.x + 7, r.bottom - 8), (r.right - 8, r.bottom - 8)):
-        pygame.draw.circle(s, (20, 22, 26), (x, y), 3)
-        pygame.draw.circle(s, C["edge"], (x, y), 3, 1)
+    s.blit(fx.plate(r), r)
     if title:
-        text(s, title, (r.x + 18, r.y + 5), 11, C["dim"], bold=True)
+        f = font(10, True)
+        tw = f.size(title)[0]
+        lr = pygame.Rect(r.x + 22, r.y + 5, tw + 14, 15)
+        pygame.draw.rect(s, (12, 13, 14), lr, border_radius=2)
+        pygame.draw.line(s, (70, 74, 78), (lr.x + 1, lr.bottom - 1), (lr.right - 2, lr.bottom - 1), 1)
+        pygame.draw.line(s, (2, 2, 3), (lr.x + 1, lr.y), (lr.right - 2, lr.y), 1)
+        text(s, title, (lr.x + 7, lr.y + 2), 10, (214, 212, 196), bold=True)
     return r
 
 
-def lcd(s, rect, bg=None):
+def lcd(s, rect, bg=None, tint=None, kind="lcd", gain=120):
+    """A display window recessed into the panel behind glass."""
     r = pygame.Rect(rect)
-    pygame.draw.rect(s, bg or C["lcd"], r, border_radius=4)
-    pygame.draw.rect(s, (0, 0, 0), r, 2, border_radius=4)
-    pygame.draw.rect(s, (60, 66, 74), r.inflate(2, 2), 1, border_radius=5)
+    bg = bg or C["lcd"]
+    fx.draw_well(s, r, bg, tint or (bg[0] * 3, bg[1] * 3, bg[2] * 3))
+    GLASS.append((r, kind, gain))
     return r
+
+
+def crt(s, rect, bg=(3, 9, 7), tint=(18, 56, 34), gain=150):
+    """A raster CRT face: scan lines, vignette, bloom and glass reflection."""
+    return lcd(s, rect, bg, tint, "crt", gain)
+
+
+def finish(s):
+    """Glaze every display drawn this frame (bloom, shadow mask, reflection)."""
+    for r, kind, gain in GLASS:
+        fx.finish_glass(s, r, kind, gain)
+    del GLASS[:]
+
+
+def _rgb(color):
+    return C[color] if isinstance(color, str) else tuple(color)
 
 
 def led(s, pos, color, on, label=None, r=6, size=10):
-    col = C[color] if isinstance(color, str) else color
+    col = _rgb(color)
     if on:
-        glow = pygame.Surface((r * 6, r * 6), pygame.SRCALPHA)
-        pygame.draw.circle(glow, (*col, 55), (r * 3, r * 3), r * 2.4)
-        s.blit(glow, (pos[0] - r * 3, pos[1] - r * 3))
-    pygame.draw.circle(s, col if on else tuple(c // 5 + 12 for c in col), pos, r)
-    pygame.draw.circle(s, (0, 0, 0), pos, r, 1)
+        g = fx.glow(r + 2, col)
+        s.blit(g, (pos[0] - g.get_width() // 2, pos[1] - g.get_height() // 2), special_flags=pygame.BLEND_RGB_ADD)
+    sp = fx.lamp(r, col, bool(on))
+    s.blit(sp, (pos[0] - sp.get_width() // 2, pos[1] - sp.get_height() // 2))
     if label:
-        text(s, label, (pos[0] + r + 6, pos[1] - size // 2 - 2), size, C["dim"], bold=True)
+        legend(s, label, (pos[0] + r + 8, pos[1] - size // 2 - 2), size, align="l")
 
 
 def bar(s, rect, frac, color="green", segs=24, peak=None):
     """Segmented LED bargraph."""
     r = pygame.Rect(rect)
-    pygame.draw.rect(s, (8, 9, 11), r)
+    pygame.draw.rect(s, (3, 4, 4), r)
     sw = r.w / segs
     n = int(max(0, min(1, frac)) * segs + 0.5)
     for i in range(segs):
-        col = C[color] if isinstance(color, str) else color
+        col = _rgb(color)
         if peak is not None and i / segs >= peak:
             col = C["red"]
         if i >= n:
-            col = tuple(c // 6 for c in col)
+            col = tuple(c // 7 for c in col)
         pygame.draw.rect(s, col, (r.x + i * sw + 1, r.y + 1, max(1, sw - 2), r.h - 2))
 
 
 def meter(s, rect, frac, label, marks=(), color=None, red_from=None):
-    """Analogue moving-coil meter. marks = [(frac, text), ...]."""
+    """Moving-coil panel meter behind glass. marks = [(frac, text), ...]."""
     r = pygame.Rect(rect)
-    pygame.draw.rect(s, (226, 220, 196), r, border_radius=5)
-    pygame.draw.rect(s, (0, 0, 0), r, 2, border_radius=5)
+    fx.draw_well(s, r, (224, 216, 188), (60, 56, 40))
+    for i in range(r.h):                                   # lamp-lit card: warm at the top
+        k = 1.0 - 0.28 * (i / r.h) ** 1.5
+        pygame.draw.line(s, (int(232 * k), int(222 * k), int(190 * k)), (r.x, r.y + i), (r.right - 1, r.y + i))
     cx, cy = r.centerx, r.bottom + r.h * 0.25
     rad = r.h * 1.02
     a0, a1 = -42, 42
 
-    def pt(fr, rr):
+    def pt(fr, rr, ox=0, oy=0):
         a = math.radians(a0 + (a1 - a0) * fr)
-        return cx + math.sin(a) * rr, cy - math.cos(a) * rr
+        return cx + math.sin(a) * rr + ox, cy - math.cos(a) * rr + oy
 
-    pts = [pt(i / 30, rad) for i in range(31)]
-    pygame.draw.lines(s, (40, 40, 40), False, pts, 2)
+    pygame.draw.lines(s, (30, 30, 30), False, [pt(i / 30, rad) for i in range(31)], 2)
     if red_from is not None:
-        pts = [pt(red_from + (1 - red_from) * i / 10, rad - 4) for i in range(11)]
-        pygame.draw.lines(s, (200, 30, 30), False, pts, 4)
+        pygame.draw.lines(s, (190, 30, 30), False, [pt(red_from + (1 - red_from) * i / 10, rad - 4) for i in range(11)], 4)
     for fr, tx in marks:
-        pygame.draw.line(s, (40, 40, 40), pt(fr, rad), pt(fr, rad + 6), 2)
-        p = pt(fr, rad + 15)
-        text(s, tx, p, 10, (40, 40, 40), bold=True, align="m")
+        pygame.draw.line(s, (30, 30, 30), pt(fr, rad), pt(fr, rad + 6), 2)
+        text(s, tx, pt(fr, rad + 15), 10, (30, 30, 30), bold=True, align="m")
     frac = max(-0.03, min(1.04, frac))
-    pygame.draw.line(s, color or (190, 30, 30), pt(frac, rad * 0.35), pt(frac, rad + 4), 2)
-    text(s, label, (r.centerx, r.bottom - 17), 10, (60, 60, 60), bold=True, align="c")
-    pygame.draw.rect(s, (0, 0, 0), r, 2, border_radius=5)
+    pygame.draw.line(s, (150, 140, 120), pt(frac, rad * 0.35, 3, 4), pt(frac, rad + 4, 3, 4), 3)     # needle shadow
+    pygame.draw.line(s, color or (170, 20, 20), pt(frac, rad * 0.35), pt(frac, rad + 4), 2)
+    text(s, label, (r.centerx, r.bottom - 17), 10, (50, 46, 40), bold=True, align="c")
+    pygame.draw.rect(s, (16, 16, 18), (r.x, r.bottom - 3, r.w, 3))
+    GLASS.append((r, "lcd", 0))
 
 
 class Widget:
@@ -193,8 +229,7 @@ class Knob(Widget):
         self.lo, self.hi, self.val, self.step, self.wrap = lo, hi, val, step, wrap
         self._raw = val
         self.fmt, self.encoder, self.on_turn = fmt, encoder, on_turn
-        self.col = color or C["white"]
-        self.drag, self.last, self.acc, self.spin = False, (0, 0), 0.0, 0.0
+        self.drag, self.last, self.acc, self.spin, self._tick = False, (0, 0), 0.0, 0.0, 0.0
 
     def set(self, v):
         self._raw = self.val = v
@@ -205,11 +240,13 @@ class Knob(Widget):
             n = int(self.acc)
             if n:
                 self.acc -= n
-                self.spin += n * 15
+                self.spin += n * 12
+                sfx("detent", 0.6)
                 if self.on_turn:
                     self.on_turn(n)
             return
         span = self.hi - self.lo
+        old = self.val
         self._raw += frac * span
         if self.wrap:
             self._raw = self.lo + (self._raw - self.lo) % span
@@ -221,6 +258,14 @@ class Knob(Widget):
             if self.wrap and v >= self.hi:
                 v = self.lo
         self.val = v
+        if self.step:
+            if v != old:
+                sfx("detent", 0.5)
+        else:                                   # smooth pot: faint wiper noise every few degrees
+            self._tick += abs(v - old) / span
+            if self._tick > 0.03:
+                self._tick = 0.0
+                sfx("pot", 0.35)
 
     def handle(self, ev):
         if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1 and self.hit(ev.pos):
@@ -249,40 +294,36 @@ class Knob(Widget):
         f = (self.val - self.lo) / (self.hi - self.lo)
         return 360 * f if self.wrap else -135 + 270 * f
 
+    style = "fluted"
+
+    def _body(self, s):
+        cx, cy, r = self.cx, self.cy, self.r
+        sh = fx.knob_shadow(r)
+        s.blit(sh, (cx - sh.get_width() // 2, cy - sh.get_height() // 2))
+        sp = fx.knob(r, self.angle(), "spun" if self.encoder else self.style)
+        s.blit(sp, (cx - sp.get_width() // 2, cy - sp.get_height() // 2))
+        if self.drag or self.hit(MOUSE):
+            pygame.draw.circle(s, C["amber"], (cx, cy), r + 3, 1)
+
     def draw(self, s):
         cx, cy, r = self.cx, self.cy, self.r
-        pygame.draw.circle(s, (9, 10, 12), (cx + 2, cy + 3), r + 3)
-        if not self.encoder and not self.wrap:
-            for i in range(11):
-                a = math.radians(-135 + 27 * i)
+        if not self.encoder:
+            n, a0, step = (12, 0, 30) if self.wrap else (11, -135, 27)
+            for i in range(n):
+                a = math.radians(a0 + step * i)
                 sa, ca = math.sin(a), math.cos(a)
-                pygame.draw.line(s, C["dim"], (cx + sa * (r + 4), cy - ca * (r + 4)),
-                                 (cx + sa * (r + 8), cy - ca * (r + 8)), 1)
-        pygame.draw.circle(s, (60, 65, 74), (cx, cy), r)
-        pygame.draw.circle(s, (27, 30, 35), (cx, cy), r - 3)
-        pygame.draw.circle(s, (92, 99, 110), (cx, cy), r, 1)
-        if self.encoder:
-            for i in range(12):
-                a = math.radians(self.spin + i * 30)
-                pygame.draw.circle(s, (70, 76, 86), (cx + math.sin(a) * (r - 7),
-                                                     cy - math.cos(a) * (r - 7)), 2)
-            a = math.radians(self.spin)
-            pygame.draw.circle(s, (14, 15, 18), (cx + math.sin(a) * r * 0.5,
-                                                 cy - math.cos(a) * r * 0.5), max(4, r // 6))
-        else:
-            a = math.radians(self.angle())
-            sa, ca = math.sin(a), math.cos(a)
-            pygame.draw.line(s, self.col, (cx + sa * r * 0.3, cy - ca * r * 0.3),
-                             (cx + sa * (r - 4), cy - ca * (r - 4)), 3)
-        if self.drag or self.hit(MOUSE):
-            pygame.draw.circle(s, C["amber"], (cx, cy), r + 2, 1)
-        text(s, self.label, (cx, cy + r + 10), 10, C["dim"], bold=True, align="c")
+                k = 9 if (i % 5 == 0 and not self.wrap) or (self.wrap and i % 3 == 0) else 6
+                pygame.draw.aaline(s, (206, 208, 200), (cx + sa * (r + 3), cy - ca * (r + 3)),
+                                   (cx + sa * (r + 3 + k), cy - ca * (r + 3 + k)))
+        self._body(s)
+        legend(s, self.label, (cx, cy + r + 12), 10)
         if self.fmt:
-            text(s, self.fmt(self.val), (cx, cy - r - 25), 12, C["amber"], bold=True, align="c")
+            text(s, self.fmt(self.val), (cx, cy - r - 27), 12, C["amber"], bold=True, align="c")
 
 
 class Selector(Knob):
     """Detented rotary switch: click left/right half or use the wheel."""
+    style = "bar"
 
     def __init__(self, cx, cy, r, label, options, idx=0, tip=""):
         super().__init__(cx, cy, r, label, 0, max(1, len(options) - 1), idx, tip)
@@ -299,12 +340,17 @@ class Selector(Knob):
     def select(self, opt):
         self.set(self.options.index(opt))
 
+    def _step(self, d):
+        old = self.idx
+        self.set(self.idx + d)
+        sfx("clunk" if self.idx != old else "stop", 0.9)
+
     def handle(self, ev):
         if ev.type == pygame.MOUSEBUTTONDOWN and ev.button in (1, 3) and self.hit(ev.pos):
-            self.set(self.idx + (1 if (ev.pos[0] >= self.cx) == (ev.button == 1) else -1))
+            self._step(1 if (ev.pos[0] >= self.cx) == (ev.button == 1) else -1)
             return True
         if ev.type == pygame.MOUSEWHEEL and self.hit(MOUSE):
-            self.set(self.idx + (1 if ev.y > 0 else -1))
+            self._step(1 if ev.y > 0 else -1)
             return True
         return False
 
@@ -315,33 +361,28 @@ class Selector(Knob):
 
     def draw(self, s):
         cx, cy, r = self.cx, self.cy, self.r
-        pygame.draw.circle(s, (9, 10, 12), (cx + 2, cy + 3), r + 3)
         n = len(self.options)
         span = min(270, 45 * (n - 1))
         for i in range(n):
             a = math.radians(-span / 2 + span * i / max(1, n - 1))
-            p = (cx + math.sin(a) * (r + 7), cy - math.cos(a) * (r + 7))
-            pygame.draw.circle(s, C["amber"] if i == self.idx else C["dim"], p, 2)
-        pygame.draw.circle(s, (50, 54, 62), (cx, cy), r)
-        pygame.draw.circle(s, (22, 24, 28), (cx, cy), r - 3)
-        a = math.radians(self.angle())
-        sa, ca = math.sin(a), math.cos(a)
-        pygame.draw.line(s, (70, 76, 86), (cx - sa * (r - 5), cy + ca * (r - 5)),
-                         (cx + sa * (r - 5), cy - ca * (r - 5)), 9)
-        pygame.draw.line(s, C["white"], (cx + sa * r * 0.35, cy - ca * r * 0.35),
-                         (cx + sa * (r - 5), cy - ca * (r - 5)), 3)
-        if self.hit(MOUSE):
-            pygame.draw.circle(s, C["amber"], (cx, cy), r + 2, 1)
-        text(s, self.label, (cx, cy + r + 10), 10, C["dim"], bold=True, align="c")
-        text(s, self.value, (cx, cy - r - 25), 12, C["amber"], bold=True, align="c")
+            p = (cx + math.sin(a) * (r + 8), cy - math.cos(a) * (r + 8))
+            if i == self.idx:
+                g = fx.glow(3, C["amber"], 0.55)
+                s.blit(g, (p[0] - g.get_width() // 2, p[1] - g.get_height() // 2), special_flags=pygame.BLEND_RGB_ADD)
+            pygame.draw.circle(s, C["amber"] if i == self.idx else (150, 152, 148), p, 2)
+        self._body(s)
+        legend(s, self.label, (cx, cy + r + 12), 10)
+        text(s, self.value, (cx, cy - r - 27), 12, C["amber"], bold=True, align="c")
 
 
 class Button(Widget):
+    """Illuminated legend push-button. snd = sound played on press."""
+
     def __init__(self, rect, label, tip="", toggle=False, color="amber", on=False,
-                 on_click=None, size=11):
+                 on_click=None, size=11, snd="press"):
         super().__init__(rect, label, tip)
         self.toggle, self.color, self.on, self.on_click, self.size = toggle, color, on, on_click, size
-        self.down, self._clicked, self._t = False, False, 0
+        self.down, self._clicked, self._t, self.snd = False, False, 0, snd
 
     @property
     def hold(self):
@@ -361,29 +402,32 @@ class Button(Widget):
     def handle(self, ev):
         if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1 and self.hit(ev.pos):
             self.down, self._t = True, pygame.time.get_ticks()
+            sfx(self.snd, 0.9)
             return True
         if ev.type == pygame.MOUSEBUTTONUP and ev.button == 1 and self.down:
             self.down = False
+            sfx("release", 0.7)
             if self.hit(ev.pos):
                 self.click()
             return True
         return False
 
     def draw(self, s):
-        r = self.rect.move(0, 1) if self.down else self.rect
-        col = C[self.color]
-        lit = self.on or self.down
-        pygame.draw.rect(s, (8, 9, 11), self.rect.move(1, 3), border_radius=5)
-        body = tuple(int(c * 0.55) for c in col) if lit else (58, 63, 72)
-        pygame.draw.rect(s, body, r, border_radius=5)
-        pygame.draw.rect(s, col if lit else (98, 105, 117), r, 1, border_radius=5)
+        r = self.rect
+        col = _rgb(self.color)
+        lit = bool(self.on or self.down)
+        if lit:
+            h = fx.halo(r.w, r.h, col)
+            s.blit(h, (r.x - 16, r.y - 16), special_flags=pygame.BLEND_RGB_ADD)
+        s.blit(fx.button(r.w, r.h, col, lit, bool(self.down)), r)
         if self.hit(MOUSE) and not lit:
-            pygame.draw.rect(s, C["amber"], r, 1, border_radius=5)
+            pygame.draw.rect(s, C["amber"], r.inflate(2, 2), 1, border_radius=6)
         lines = self.label.split("\n")
-        y = r.centery - (len(lines) - 1) * (self.size * 0.62)
+        dy = 1 if self.down else 0
+        y = r.centery - (len(lines) - 1) * (self.size * 0.62) + dy
+        tc = (26, 16, 6) if lit else (208, 210, 206)
         for ln in lines:
-            text(s, ln, (r.centerx, y), self.size, C["white"] if lit else C["text"],
-                 bold=True, align="m")
+            text(s, ln, (r.centerx, y), self.size, tc, bold=True, align="m")
             y += self.size * 1.25
 
 
@@ -392,7 +436,7 @@ class Guard(Button):
 
     def __init__(self, rect, label="DISTRESS", tip="", hold_s=3.0):
         super().__init__(rect, label, tip, color="red")
-        self.hold_s, self.open_until, self._fired, self.armed = hold_s, 0, False, True
+        self.hold_s, self.open_until, self._fired, self.armed, self._was_open = hold_s, 0, False, True, False
 
     def pop_fired(self):
         f, self._fired = self._fired, False
@@ -406,11 +450,14 @@ class Guard(Button):
         if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1 and self.hit(ev.pos):
             if not self.cover_open:
                 self.open_until = pygame.time.get_ticks() + 12000
+                sfx("cover", 1.0)
             else:
                 self.down, self._t, self.armed = True, pygame.time.get_ticks(), True
+                sfx("press", 1.0)
             return True
         if ev.type == pygame.MOUSEBUTTONUP and ev.button == 1 and self.down:
             self.down = False
+            sfx("release", 0.8)
             return True
         return False
 
@@ -419,38 +466,39 @@ class Guard(Button):
             self._fired, self.armed = True, False
             self.open_until = 0
             self.down = False
+            sfx("thunk", 1.0)
+        if self._was_open and not self.cover_open:
+            sfx("cover", 0.7)
+        self._was_open = self.cover_open
 
     def draw(self, s):
         self.update()
         r = self.rect
-        pygame.draw.rect(s, (90, 14, 10), r, border_radius=8)
-        pygame.draw.rect(s, C["red"], r, 2, border_radius=8)
-        if self.cover_open:
-            pygame.draw.circle(s, C["red"] if not self.down else (255, 150, 140),
-                               r.center, min(r.w, r.h) // 2 - 8)
-            text(s, "HOLD", r.center, 11, C["white"], bold=True, align="m")
+        op = self.cover_open
+        if op:
+            h = fx.halo(r.w, r.h, (255, 40, 30), 0.22 + 0.2 * (pygame.time.get_ticks() // 250 % 2))
+            s.blit(h, (r.x - 16, r.y - 16), special_flags=pygame.BLEND_RGB_ADD)
+        s.blit(fx.guard(r.w, r.h, op, bool(self.down)), r)
+        if op:
+            text(s, "HOLD", (r.centerx, r.centery + 2), 11, C["white"], bold=True, align="m")
             if self.down:
                 f = min(1, self.hold / self.hold_s)
-                pygame.draw.arc(s, C["yellow"], r.inflate(-6, -6), math.pi / 2 - f * 2 * math.pi,
-                                math.pi / 2, 5)
+                pygame.draw.arc(s, C["yellow"], r.inflate(-10, -10), math.pi / 2 - f * 2 * math.pi, math.pi / 2, 5)
         else:
-            for i in range(-r.h, r.w, 14):
-                pygame.draw.line(s, (150, 30, 24), (r.x + max(0, i), r.y + max(0, -i)),
-                                 (r.x + min(r.w, i + r.h), r.y + min(r.h, r.h - max(0, i + r.h - r.w))), 4)
-            pygame.draw.rect(s, (140, 150, 160), r.inflate(-10, -10), 2, border_radius=6)
-            text(s, self.label, (r.centerx, r.centery - 8), 12, C["white"], bold=True, align="m")
-            text(s, "LIFT COVER", (r.centerx, r.centery + 9), 9, C["white"], bold=True, align="m")
+            legend(s, self.label, (r.centerx, r.centery - 15), 12, C["white"])
+            legend(s, "LIFT COVER", (r.centerx, r.centery + 3), 9, C["white"])
         if self.hit(MOUSE):
             pygame.draw.rect(s, C["yellow"], r.inflate(4, 4), 1, border_radius=9)
 
 
-def keypad(station, x, y, rows, w=44, h=34, gap=6, tip="Keypad"):
+def keypad(station, x, y, rows, w=44, h=34, gap=6, tip="Keypad", snd="key"):
     """Add a grid of buttons to a station; returns {label: Button}."""
     keys = {}
     for j, row in enumerate(rows):
         for i, k in enumerate(row):
             if k:
-                keys[k] = station.add(Button((x + i * (w + gap), y + j * (h + gap), w, h), k, tip))
+                sn = (snd + k) if snd == "dtmf" else snd
+                keys[k] = station.add(Button((x + i * (w + gap), y + j * (h + gap), w, h), k, tip, snd=sn))
     return keys
 
 

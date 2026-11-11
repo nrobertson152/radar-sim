@@ -85,6 +85,7 @@ class Sarsat(Station):
 
     def ev(self, msg, col=None, t=None):
         self.events.append((self.st if t is None else t, msg, col or C["text"]))
+        ui.sfx("blip", 0.5)
 
     def activate(self, how):
         if self.active:
@@ -94,10 +95,13 @@ class Sarsat(Station):
         self.blat, self.blon = w.lat, w.lon
         w.epirb_on = True
         self.flags["epirb_on"] = w.t
+        ui.sfx("thunk")
         self.ev("BEACON ACTIVATED (%s) - 121.5 MHz homer on, strobe on" % how, C["red"])
 
     def _burst(self, t):
         self.nburst += 1
+        if self.app.station is self:
+            ui.sfx("burst406", 0.6)
         gn = self.b_gnss.on
         if self.nburst == 1:
             self.ev("FIRST 406 MHz BURST - 5 W, 0.5 s, repeats every 50 s", C["amber"], t)
@@ -169,6 +173,7 @@ class Sarsat(Station):
             self.activate("manual")
         elif sv == "TEST" and getattr(self, "_sw", "") != "TEST":
             self.test_until = w.t + 4
+            ui.sfx("beep2")
             self.ev("SELF-TEST: one inverted-sync burst, battery and 406/121.5 circuits OK. No alert generated.", C["cyan"])
             self.flags["epirb_test"] = w.t
         elif sv == "OFF" and self.active and getattr(self, "_sw", "") != "OFF":
@@ -228,6 +233,7 @@ class Sarsat(Station):
         ui.panel(s, (930, 54, 660, 204), "406 MHz EPIRB  -  FLOAT-FREE, CATEGORY 1")
         ui.panel(s, (930, 266, 660, 196), "9 GHz RADAR SART   |   SIMULATION")
         ui.panel(s, (930, 470, 660, 390), "ALERT CHAIN TIMELINE")
+        ui.crt(s, self.map.rect, gain=80)
         self.map.draw(s)
         blat, blon = (self.blat, self.blon) if self.active else (w.lat, w.lon)
         for nm, lon in GEOSAR:
@@ -280,6 +286,9 @@ class Sarsat(Station):
         for i, r in enumerate(rows):
             text(s, r, (l.x + 10, l.y + 6 + i * 21), 12, (C["red"] if trig else fg) if i == 1 else fg, bold=i == 1)
         ui.led(s, (956, 304), "red", trig and int(w.t * 6) % 2 == 0, "TRIGGERED", 6)
+        if trig and w.t - getattr(self, "_bip", 0) > 1.6:                     # a SART beeps while a radar is painting it
+            self._bip = w.t
+            ui.sfx("sart", 0.6)
         # timeline
         y = 498
         if not self.events:
@@ -305,13 +314,11 @@ class Sarsat(Station):
         return "%02d:%02d:%02d" % (t // 3600, t // 60 % 60, t % 60)
 
     def _draw_doppler(self, s):
-        r = pygame.Rect(80, 564, 560, 262)
-        pygame.draw.rect(s, (4, 8, 12), r)
+        r = ui.crt(s, (86, 566, 554, 256))
         for k in (-10, -5, 0, 5, 10):
             y = r.centery - k / 11.0 * r.h / 2
             pygame.draw.line(s, (40, 60, 84) if k == 0 else (22, 32, 44), (r.x, y), (r.right, y), 1)
-            text(s, "%+d kHz" % k, (r.x - 4, y - 6), 9, C["dim"], align="r")
-        pygame.draw.rect(s, C["edge"], r, 1)
+            text(s, "%+d kHz" % k, (r.x - 10, y - 6), 9, C["dim"], align="r")
         p = self.plot
         x0 = 660
         if not p or not p["pts"]:
@@ -329,7 +336,7 @@ class Sarsat(Station):
             pygame.draw.circle(s, C["green"], q, 3)
         for m in range(0, int(span / 60) + 1, 3):
             x = r.x + 10 + m * 60 / span * (r.w - 20)
-            text(s, "%d min" % m, (x, r.bottom + 2), 9, C["dim"], align="c")
+            text(s, "%d min" % m, (x, r.bottom + 9), 9, C["dim"], align="c")
         dfs = [d for _, d in p["pts"]]
         tca = None
         for (ta, da), (tb, db) in zip(p["pts"], p["pts"][1:]):

@@ -1,2 +1,3 @@
 pygame-ce>=2.3
 numpy>=1.22
+espeakng-loader>=0.2

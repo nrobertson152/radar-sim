@@ -6,7 +6,7 @@ stations, so you can go from operator symptom to faulty stage.
 import math
 import numpy as np
 import pygame
-from . import ui
+from . import ui, fx
 from .ui import C, text, Selector, Button, Station
 from .radar import PULSES
 
@@ -291,6 +291,7 @@ class Bench(Station):
                 if pygame.Rect(b[2], b[3], BW, BH).collidepoint(ev.pos):
                     if self.sel[self.which] != b[0] and self.fault[self.which]:
                         self.probes += 1
+                    ui.sfx("probe")
                     self.sel[self.which] = b[0]
                     return True
         return False
@@ -309,7 +310,9 @@ class Bench(Station):
             ids = [b[0] for b in self.blocks]
             f = ids[int(self.rng.integers(len(ids)))]
             self.inject(k, f)
+            ui.sfx("fault")
         if self.b_fix.pop():
+            ui.sfx("ok")
             f = self.fault[k]
             self.repair(k)
             self.result = ("Repaired. The fault was in: %s." % self.label(k, f)) if f else "No fault present. All stages healthy."
@@ -321,10 +324,12 @@ class Bench(Station):
                 pts = max(10, 100 - 8 * max(0, self.probes - 4))
                 self.score += pts
                 self.flags["diagnosed_" + k] = w.t
+                ui.sfx("done")
                 self.result = "CORRECT - %s was faulty. Found in %d probes: +%d points. Stage replaced, equipment restored." % (self.label(k, f), self.probes, pts)
                 self.repair(k)
             else:
                 self.score -= 20
+                ui.sfx("error")
                 ok = (self.alive_radar(self.world.rh) if k == "R" else self.alive_ssb(self.world.hh)).get(self.sel[k])
                 self.result = "WRONG (-20). %s %s Find the FIRST stage whose inputs are good but whose output is dead." % (
                     self.label(k, self.sel[k]), "is producing a normal output." if ok else "has no output, but is its INPUT present? A stage with no input is not faulty.")
@@ -399,9 +404,10 @@ class Bench(Station):
         for i, b in enumerate(self.blocks):
             r = pygame.Rect(b[2], b[3], BW, BH)
             selb = self.sel[k] == b[0]
-            pygame.draw.rect(s, (10, 11, 13), r.move(2, 3), border_radius=6)
-            pygame.draw.rect(s, (62, 70, 82) if selb else C["panel2"], r, border_radius=6)
-            pygame.draw.rect(s, C["amber"] if selb else (C["green"] if (learn and alive.get(b[0])) else C["edge"]), r, 2 if selb else 1, border_radius=6)
+            pygame.draw.rect(s, (6, 7, 8), r.move(3, 4), border_radius=7)
+            s.blit(fx.module(BW, BH, selb), r)
+            if selb:
+                pygame.draw.rect(s, C["amber"], r, 2, border_radius=6)
             lines = ui.wrap(b[1], 11, BW - 12, bold=True)
             y = r.centery - len(lines) * 7 + 1
             for ln in lines:
@@ -422,8 +428,7 @@ class Bench(Station):
             hf = self.app.hf
             text(s, "dial %.2f kHz  IF 455 kHz  synth %.2f kHz" % (hf.f, hf.f + 455), (1136, 278), 11, C["cyan"])
         # scope
-        r = pygame.Rect(1136, 350, 438, 226)
-        pygame.draw.rect(s, (5, 14, 10), r)
+        r = ui.crt(s, (1136, 350, 438, 226))
         for i in range(1, 8):
             pygame.draw.line(s, (22, 44, 34), (r.x + r.w * i / 8, r.y), (r.x + r.w * i / 8, r.bottom), 1)
         for i in range(1, 6):
@@ -449,17 +454,16 @@ class Bench(Station):
             plot(fn(blk[0], ra), (70, 84, 78), 1)
             self.rng.bit_generator.state = st
         plot(yv, C["green"], 2)
-        pygame.draw.rect(s, C["edge"], r, 1)
         if spec:
             for kk, lab in ((60, "455 kHz IF"), (85, "SYNTH"), (110, "RF")):
                 x = r.x + kk * (r.w / 160.0)
                 pygame.draw.line(s, (120, 60, 60), (x, r.y), (x, r.y + 12), 1)
                 text(s, lab, (x, r.y + 13), 8, (190, 110, 110), bold=True, align="c")
-            text(s, "0 dB top, 10 dB/div. Frequency axis: audio at left; carriers not to scale", (r.x, r.bottom + 5), 10, C["dim"], mono=False)
+            text(s, "0 dB top, 10 dB/div. Frequency axis: audio at left; carriers not to scale", (r.x, r.bottom + 10), 10, C["dim"], mono=False)
         elif k == "R":
-            text(s, "timebase: 2 pulse periods (pulse width exaggerated). grey = healthy reference", (r.x, r.bottom + 5), 10, C["dim"], mono=False)
+            text(s, "timebase: 2 pulse periods (pulse width exaggerated). grey = healthy reference", (r.x, r.bottom + 10), 10, C["dim"], mono=False)
         else:
-            text(s, "timebase: 4 ms (RF cycles not to scale). grey = healthy reference", (r.x, r.bottom + 5), 10, C["dim"], mono=False)
+            text(s, "timebase: 4 ms (RF cycles not to scale). grey = healthy reference", (r.x, r.bottom + 10), 10, C["dim"], mono=False)
         ui.led(s, (1246, 324), "green", bool(alive.get(blk[0])), "SIGNAL" if alive.get(blk[0]) else "NO SIGNAL", 5)
         # fault panel
         f = self.fault[k]

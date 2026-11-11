@@ -366,7 +366,7 @@ class Training(Station):
             self.btns.append(self.add(Button((36, 84 + i * 47, 438, 40), d.title, d.brief, size=11)))
         self.b_start = self.add(Button((1250, 84, 150, 44), "START DRILL", "Set up the scenario and start the clock.", color="green", size=13))
         self.b_stop = self.add(Button((1410, 84, 164, 44), "ABANDON DRILL", "Stop the current drill.", color="red", size=13))
-        self.b_go = self.add(Button((516, 300, 240, 36), "GO TO STATION", "Jump to the station where this drill takes place."))
+        self.b_go = self.add(Button((516, 304, 240, 34), "GO TO STATION", "Jump to the station where this drill takes place."))
 
     def start(self, i):
         d = self.drills[i]
@@ -380,6 +380,7 @@ class Training(Station):
             b.on = i == self.sel
         if self.b_start.pop():
             self.start(self.sel)
+            ui.sfx("beep2")
         if self.b_stop.pop():
             self.active = None
         if self.b_go.pop():
@@ -396,8 +397,10 @@ class Training(Station):
                 if not ok:
                     break
                 self.step += 1
+                ui.sfx("ok")
             if self.step >= len(d.steps):
                 self.done_t = self.world.t - self.t0
+                ui.sfx("done")
                 if d.best is None or self.done_t < d.best:
                     d.best = self.done_t
 
@@ -416,31 +419,33 @@ class Training(Station):
         ui.panel(s, (20, 54, 470, 806), "DRILLS")
         ui.panel(s, (500, 54, 1090, 806), "BRIEFING")
         d = self.drills[self.sel]
+        ui.crt(s, (512, 140, 1064, 150), (4, 9, 7))
+        ui.crt(s, (512, 360, 1064, 484), (4, 9, 7))
         text(s, d.title, (516, 84), 20, C["amber"], bold=True, mono=False)
         text(s, "STATION: " + d.where, (516, 116), 12, C["cyan"], bold=True)
-        ui.text_block(s, d.brief, (516, 146, 1040, 140), 15, C["text"], mono=False, lh=23)
+        ui.text_block(s, d.brief, (526, 150, 1036, 136), 15, C["lcdfg"], mono=False, lh=23)
         run = self.active is d
-        y = 366
-        text(s, "STEPS", (516, y - 22), 12, C["dim"], bold=True)
+        y = 370
+        ui.legend(s, "STEPS", (516, y - 28), 11, align="l")
         for i, (st, _) in enumerate(d.steps):
             done = run and i < self.step
             cur = run and i == self.step and self.done_t is None
             col = C["green"] if done else (C["white"] if cur else C["dim"])
-            pygame.draw.rect(s, (40, 46, 54) if cur else (28, 32, 37), (516, y, 1056, 40), border_radius=5)
-            pygame.draw.circle(s, col, (540, y + 20), 11, 0 if done else 2)
+            pygame.draw.rect(s, (16, 44, 30) if cur else (8, 18, 14), (522, y, 1044, 40), border_radius=5)
+            pygame.draw.circle(s, col, (546, y + 20), 11, 0 if done else 2)
             if done:
-                pygame.draw.lines(s, (10, 30, 14), False, [(534, y + 20), (539, y + 25), (547, y + 14)], 3)
+                pygame.draw.lines(s, (10, 30, 14), False, [(540, y + 20), (545, y + 25), (553, y + 14)], 3)
             else:
-                text(s, str(i + 1), (540, y + 20), 11, col, bold=True, align="m")
-            text(s, st, (566, y + 11), 14, col, bold=cur, mono=False)
+                text(s, str(i + 1), (546, y + 20), 11, col, bold=True, align="m")
+            text(s, st, (572, y + 11), 14, col, bold=cur, mono=False)
             y += 46
         y += 10
         if run and self.done_t is not None:
-            text(s, "COMPLETE in %d seconds" % self.done_t, (516, y), 22, C["green"], bold=True, mono=False)
+            text(s, "COMPLETE in %d seconds" % self.done_t, (530, y), 22, C["green"], bold=True, mono=False)
         elif run:
-            text(s, "RUNNING  %d s" % (self.world.t - self.t0), (516, y), 18, C["amber"], bold=True)
+            text(s, "RUNNING  %d s" % (self.world.t - self.t0), (530, y), 18, C["amber"], bold=True)
         else:
-            text(s, "Press START DRILL. The scenario is set up for you.", (516, y), 14, C["dim"], mono=False)
+            text(s, "Press START DRILL. The scenario is set up for you.", (530, y), 14, (90, 150, 110), mono=False)
         super().draw(s)
         for i, dd in enumerate(self.drills):
             if dd.best is not None:

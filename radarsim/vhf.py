@@ -8,8 +8,9 @@ import math
 import pygame
 from . import ui
 from .ui import C, text, Knob, Selector, Button, Guard, Station
-from .world import vhf_channel, VHF_CHANNELS, VHF_USE, CPS, Src, fmt_lat, fmt_lon
+from .world import vhf_channel, VHF_CHANNELS, VHF_USE, CPS, Src, Msg, fmt_lat, fmt_lon
 from .radiocore import Monitor, garble
+from .speech import SR, chunk
 
 NATURES = ["UNDESIGNATED", "FIRE, EXPLOSION", "FLOODING", "COLLISION", "GROUNDING",
            "LISTING, CAPSIZING", "SINKING", "DISABLED AND ADRIFT", "ABANDONING SHIP",
@@ -38,6 +39,7 @@ class VUHF(Station):
         self.pending, self.seen, self.flags = [], set(), {}
         self.af = 121.5
         self.last_rx = None
+        self._was_open = {}
         tipdsc = "Digital Selective Calling runs on channel 70 through a separate watch receiver. "
         self.pwr = self.add(Button((36, 246, 64, 40), "PWR", "Radio power.", toggle=True, on=True, color="green"))
         self.b16 = self.add(Button((106, 246, 64, 40), "16", "Instant select channel 16 "
@@ -146,7 +148,8 @@ class VUHF(Station):
         src = m.src if is_msg else m["src"]
         hdr = "%s  %s  %s  %d dBm" % (w.utc_str(), label, src.name, l["pr"])
         if is_msg:
-            n = min(len(m.text), int((w.t - m.t0) * CPS))
+            m.clip()
+            n = m.chars(w.t)
             p = m.prog.get(rid, 0)
             if st["open"]:
                 for i in range(p, n):
@@ -155,10 +158,20 @@ class VUHF(Station):
                     self.flags["heard:" + src.name] = w.t
             m.prog[rid] = n
         elif st["open"]:
-            i = int(w.t * CPS)
-            if i != st.get("bi"):
-                st["bi"] = i
-                self.mon.feed((rid, m["key"]), hdr, garble(m["text"][i % len(m["text"])], q, i))
+            txt = m["text"]
+            clip = Msg.speech.get(txt, src.name) if (Msg.speech and Msg.speech.ok and m["kind"] == "voice") else None
+            if clip is not None:
+                L = len(clip) + SR
+                i = int(min(1.0, (int(w.t * SR) % L) / float(len(clip))) * len(txt.rstrip()))
+            else:
+                i = int(w.t * CPS) % len(txt)
+            last = st.get("bi", i)
+            if i < last:
+                last = 0
+                self.mon.key = None
+            for j in range(last, i):
+                self.mon.feed((rid, m["key"]), hdr, garble(txt[j], q, j))
+            st["bi"] = i
         return st
 
     # ------------------------------------------------------------------ DSC
@@ -232,6 +245,7 @@ class VUHF(Station):
                     self.log("  POS %s" % d["pos"], col)
                 self.log("  LISTEN CH16. DO NOT ACK BY DSC.", col)
                 self.dsc_alarm = True
+                ui.sfx("fsk", 0.5)
                 self.flags["dsc_rx_" + d["cat"].lower()] = w.t
                 self.last_rx = m
 
@@ -282,12 +296,16 @@ class VUHF(Station):
         self.alert = self.dsc_alarm
         # marine PTT
         tx = on and (self.ptt.down or (self.key_ptt and self.app.station is self))
+        if tx != self.tx:
+            ui.sfx("relay", 0.9)
         if tx and not self.tx:
             self.tx_t0 = w.t
         if self.tx and not tx:
             self._released(w.t - self.tx_t0)
         self.tx = tx
         atx = self.aptt.down
+        if atx != self.atx:
+            ui.sfx("relay", 0.9)
         if atx and not self.atx:
             self.atx_t0 = w.t
         if self.atx and not atx:
@@ -312,6 +330,12 @@ class VUHF(Station):
                 self._rx("A", gf, athr, "GUARD %.1f" % gf)
         else:
             self.rxs["A"] = dict(open=False, sig=None, link=None, thr=athr)
+
+        for rid in ("M", "A"):                       # squelch tail when a carrier drops
+            now = bool(self.rxs[rid].get("open"))
+            if self._was_open.get(rid) and not now and self.app.station is self:
+                ui.sfx("sqtail", 0.5 * (self.vol.val if rid == "M" else self.avol.val))
+            self._was_open[rid] = now
 
     def _released(self, dur):
         w = self.world
@@ -378,12 +402,25 @@ class VUHF(Station):
 
     # ----------------------------------------------------------------- audio
     def _radio_audio(self, syn, n, st, vol, sql_open, key):
+        w = self.world
         if st.get("open") and st.get("sig") is not None:
             if st["kind"] == "sweep":
                 return syn.sweep(key, n) * vol
-            src = st["sig"].src if hasattr(st["sig"], "src") else st["sig"]["src"]
+            sig = st["sig"]
+            is_msg = hasattr(sig, "src")
+            src = sig.src if is_msg else sig["src"]
             weak = max(0.0, min(1.0, (-104 - st["link"]["pr"]) / 16.0))
-            return (syn.voice(key + src.name, n) * 1.6 + syn.noise(n) * weak) * vol
+            hiss = syn.noise(n) * (0.05 + weak)
+            clip = sig.clip() if is_msg else (Msg.speech.get(sig["text"], src.name) if Msg.speech and Msg.speech.ok else None)
+            if clip is None:                       # speech not available: old speech-shaped noise
+                return (syn.voice(key + src.name, n) * 1.6 + hiss) * vol
+            L = len(clip) + SR
+            exp = int((w.t - sig.t0) * SR) if is_msg else int(w.t * SR) % L
+            cur = st.get("cur")
+            if st.get("cur_id") != id(sig) or cur is None or abs(cur - exp) > SR * 0.3:
+                cur = exp
+            st["cur_id"], st["cur"] = id(sig), (cur + n) if is_msg else (cur + n) % L
+            return (chunk(clip, cur, n).real * 1.25 + hiss) * vol
         if sql_open:
             return syn.noise(n) * 0.5 * vol
         return None
@@ -399,14 +436,15 @@ class VUHF(Station):
             a = self._radio_audio(syn, n, self.rxs["A"], self.avol.val, self.asql.val < 0.12, "va")
             if a is not None:
                 out = out + a
-        if w.t < self.burst_until:
-            out = out + syn.fsk("dscv", n, 1200, 1700.0, 800.0) * 0.6
         return out if not isinstance(out, int) else None
 
     def bg_audio(self, syn, n):
+        out = None
+        if self.world.t < self.burst_until:
+            out = syn.fsk("dscv", n, 1200, 1700.0, 800.0) * 0.5
         if self.dsc_alarm:
-            return syn.alarm("dscal", n) * 0.35
-        return None
+            out = (0 if out is None else out) + syn.alarm("dscal", n) * 0.35
+        return out
 
     # ------------------------------------------------------------------ draw
     def tip_at(self, pos):

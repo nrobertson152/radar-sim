@@ -131,10 +131,27 @@ class Contact(Src):
 
 
 class Msg:
+    speech = None                      # set by the app: radarsim.speech.Speech
+
     def __init__(self, f, mode, src, text, t0, kind="voice", dsc=None):
         self.f, self.mode, self.src, self.text, self.t0, self.kind, self.dsc = f, mode, src, text, t0, kind, dsc
         self.dur = max(1.5, len(text) / CPS) if kind == "voice" else 1.2
         self.prog = {}
+        self._clip = None
+        self.clip()
+
+    def clip(self):
+        """The spoken audio for this message once it has been synthesised."""
+        if self._clip is None and self.kind == "voice" and Msg.speech is not None and Msg.speech.ok:
+            c = Msg.speech.get(self.text, self.src.name)
+            if c is not None:
+                self._clip = c
+                self.dur = max(self.dur if self.prog else 0.0, len(c) / 22050.0 + 0.25)
+        return self._clip
+
+    def chars(self, t):
+        """How many characters of the text have been spoken by time t."""
+        return max(0, min(len(self.text), int((t - self.t0) / max(0.1, self.dur - 0.25) * len(self.text))))
 
     def active(self, t):
         return self.t0 <= t <= self.t0 + self.dur
@@ -170,7 +187,7 @@ HF_STATIONS = []
 
 def _hf(name, lat, lon, f, mode, pkw, kind, text="", duty=None):
     HF_STATIONS.append(dict(name=name, lat=lat, lon=lon, f=f, mode=mode, pkw=pkw, kind=kind,
-                            text=text, duty=duty, key="%s%g" % (name, f)))
+                            text=text, duty=duty, key="%s%g" % (name, f), _ph=(len(name) * 13 + int(f)) % 50))
 
 
 _T_NS = ("ALL SHIPS ALL SHIPS THIS IS NORTHSEA RADIO NORTHSEA RADIO. TRAFFIC LIST FOLLOWS. "
@@ -367,9 +384,8 @@ class World:
             seq = VHF_SCRIPT[self._seq % len(VHF_SCRIPT)]
             ch, who, txt = seq[self._seq_i]
             src = self.srcs[who]
-            if getattr(src, "active", True) or who == "RESCUE 193":
-                m = self.say(ch, src, txt)
-                self._next = m.t0 + m.dur + 2.5
+            m = self.say(ch, src, txt)
+            self._next = m.t0 + m.dur + 2.5
             self._seq_i += 1
             if self._seq_i >= len(seq):
                 self._seq_i, self._seq = 0, self._seq + 1
@@ -450,7 +466,7 @@ class World:
         if not st["duty"]:
             return True
         per, on = st["duty"]
-        return ((self.t + hash(st["key"]) % 50) % per) < on
+        return ((self.t + st.get("_ph", 0)) % per) < max(on, st.get("_on", 0))
 
     # ------------------------------------------------------------ LEO sats
     def leo_pos(self, sat, t):
