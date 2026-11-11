@@ -17,7 +17,7 @@ class Monitor:
     at a time, garbled according to signal quality and tuning accuracy."""
 
     def __init__(self, maxlines=120):
-        self.lines, self.key, self.maxlines = [], None, maxlines
+        self.lines, self.key, self.maxlines, self.snd = [], None, maxlines, None
 
     def feed(self, key, header, ch, color=None):
         if key != self.key or not self.lines:
@@ -31,6 +31,8 @@ class Monitor:
     def note(self, header, msg, color=None):
         self.lines.append([header, msg, color or C["amber"]])
         self.key = None
+        if self.snd:
+            ui.sfx(self.snd, 0.8)
         del self.lines[:-self.maxlines]
 
     def text_all(self):

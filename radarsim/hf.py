@@ -14,6 +14,8 @@ from . import ui
 from .ui import C, text, Knob, Selector, Button, Guard, Station
 from .world import HF_STATIONS, HF_DSC, HF_RT, ITU_BANDS, itu_channel, s_units, s_text, CPS, fmt_lat, fmt_lon
 from .radiocore import Monitor, garble
+from .speech import SR, chunk
+from .world import Msg
 
 MODES = ["USB", "LSB", "AM", "CW", "FSK"]
 EMISSION = {"USB": "J3E", "LSB": "J3E", "AM": "H3E", "CW": "A1A", "FSK": "F1B"}
@@ -218,7 +220,7 @@ class HF(Station):
 
     def stations(self):
         w = self.world
-        self.temp = [t for t in self.temp if w.t < t["t0"] + len(t["text"]) / CPS + 1]
+        self.temp = [t for t in self.temp if w.t < t["t0"] + t.get("_len", 30.0)]
         return HF_STATIONS + self.temp
 
     def rx_ok(self, audio=True):
@@ -268,6 +270,11 @@ class HF(Station):
             self.send_distress()
         # transmit
         tx = (self.ptt.down or (self.key_ptt and self.app.station is self)) and not self.tuning_until
+        if tx != self.tx:
+            ui.sfx("relay", 1.0)
+        if self.tuning_until and w.t - getattr(self, "_rl", 0) > 0.13:      # tuner relays hunting for a match
+            self._rl = w.t
+            ui.sfx("relay", 0.45)
         if tx and not self.tx:
             self.tx_t0 = w.t
         if self.tx and not tx:
@@ -292,7 +299,10 @@ class HF(Station):
         # receive
         frx = self.f + self.rit.val / 1000.0
         self.sigs = []
+        answering = {t["f"] for t in self.temp}      # a station replying to us stops its broadcast
         for st in self.stations():
+            if "t0" not in st and st["f"] in answering:
+                continue
             if abs(st["f"] - self.f) < SPAN / 2 + 3 and w.hf_on(st):
                 self.sigs.append((st, w.hf_rx(st)))
         self.noise = w.hf_noise(self.f)
@@ -318,26 +328,53 @@ class HF(Station):
             self._wt = 0.0
             self._spectrum()
 
+    def voice_pos(self, st):
+        """(clip, sample position) of a voice station's transmission right now."""
+        sp = Msg.speech
+        if st["kind"] != "voice" or sp is None or not sp.ok:
+            return None, 0
+        clip = sp.get(st["text"], st["name"])
+        if clip is None:
+            return None, 0
+        w = self.world
+        if "t0" in st:
+            st["_len"] = len(clip) / float(SR) + 1.0
+            return clip, int((w.t - st["t0"]) * SR)
+        if st["duty"]:
+            st["_on"] = len(clip) / float(SR) + 1.0
+            return clip, int(((w.t + st.get("_ph", 0)) % st["duty"][0]) * SR)
+        return clip, int(w.t * SR) % (len(clip) + int(SR * 1.5))
+
     def _caption(self, st, p, dm):
         w = self.world
         rate = RATE[st["kind"]]
         if not rate or dm.get("silent"):
             return
         txt = st["text"]
-        if "t0" in st:
+        clip, pos = self.voice_pos(st)
+        if clip is not None:
+            i = int(pos / float(len(clip)) * len(txt.rstrip()))
+            if pos < 0 or i >= len(txt.rstrip()):
+                st["_ci"] = None
+                return
+        elif "t0" in st:
             i = int((w.t - st["t0"]) * rate)
-            if i >= len(txt):
+            if i < 0 or i >= len(txt):
                 return
         else:
             i = int(w.t * rate)
-        if st.get("_ci") == i:
+        last = st.get("_ci")
+        if last == i:
             return
+        if last is None or i < last or i - last > 12:
+            last = i - 1
         st["_ci"] = i
-        ch = garble(txt[i % len(txt)], dm["q"], i)
         hdr = "%s  %s  %g kHz  %s  SNR %d dB  via %s" % (w.utc_str(), st["name"], st["f"], s_text(p["pr"]), p["snr"], p["mode"])
-        self.mon.feed(st["key"] + self.mode.value, hdr, ch, C["lcdfg"] if dm["q"] > 0.6 else C["amber"])
-        if dm["q"] > 0.85 and ch != " ":
-            self.flags["copy:" + st["name"]] = self.flags.get("copy:" + st["name"], 0) + 1
+        for j in range(last + 1, i + 1):
+            ch = garble(txt[j % len(txt)], dm["q"], j)
+            self.mon.feed(st["key"] + self.mode.value, hdr, ch, C["lcdfg"] if dm["q"] > 0.6 else C["amber"])
+            if dm["q"] > 0.85 and ch != " ":
+                self.flags["copy:" + st["name"]] = self.flags.get("copy:" + st["name"], 0) + 1
 
     def _dsc_watch(self):
         w = self.world
@@ -351,6 +388,7 @@ class HF(Station):
                 p = w.hf_rx(st)
                 if p["snr"] > 8:
                     self.log("RX %g kHz ROUTINE TEST  SNR %d dB" % (st["f"], p["snr"]))
+                    ui.sfx("blip", 0.5)
             self.dsc_seen[st["key"]] = on
 
     def send_distress(self):
@@ -362,6 +400,7 @@ class HF(Station):
         self.atu_f = f
         self.distress = dict(t0=w.t, f=f, acked=False)
         self.flags["hf_distress_sent"] = f
+        self.burst_until = w.t + 1.6
         self.log("TX DISTRESS ALERT ON %g kHz" % f, C["red"])
         self.log("  %s %s" % (fmt_lat(w.lat), fmt_lon(w.lon)), C["red"])
         st = next(s for s in HF_STATIONS if s["kind"] == "dsc" and (s["f"] == f or (f > 3000 and s["f"] > 3000)))
@@ -374,10 +413,12 @@ class HF(Station):
             if p["snr"] > 8:
                 d["acked"] = True
                 self.flags["hf_distress_acked"] = f
+                ui.sfx("beep2")
                 self.log("RX DISTRESS ACK ON %g kHz" % f, C["yellow"])
                 self.log("  COAST STATION %d km  SNR %d dB" % (p["d"], p["snr"]), C["yellow"])
                 self.log("  GO TO R/T %g kHz - SEND MAYDAY" % HF_RT[self.dband.idx], C["yellow"])
             else:
+                ui.sfx("error")
                 self.log("NO ACK ON %g kHz (SNR %d dB AT COAST)" % (f, p["snr"]), C["amber"])
                 self.log("  PATH CLOSED - TRY ANOTHER BAND", C["amber"])
         self.after(9, ack)
@@ -422,7 +463,7 @@ class HF(Station):
         self.flags["hf_contact:" + st["name"]] = w.t
         self.flags["hf_contact"] = w.t
         self.temp.append(dict(name=st["name"], lat=st["lat"], lon=st["lon"], f=st["f"], mode="USB", pkw=st["pkw"],
-                              kind="voice", duty=None, key="rep%d" % int(w.t), t0=w.t + 2.5,
+                              kind="voice", duty=None, key="rep%d" % int(w.t), t0=w.t + 3.0,
                               text="%s, %s, THIS IS %s. GOOD %s. READING YOU STRENGTH %d. PASS YOUR MESSAGE. OVER.   "
                               % (w.name, w.name, st["name"], "EVENING" if w.utc_h > 17 or w.utc_h < 4 else "DAY", rd)))
 
@@ -460,9 +501,14 @@ class HF(Station):
             line[:] = -150
         self.line = line
         self.wf[:, 1:] = self.wf[:, :-1]
-        self.wf[:, 0] = np.clip((line + 125) / 75.0 * 255, 0, 255).astype(np.uint8)
+        self.wf[:, 0] = np.clip((line - (self.noise - 21) + (20 if self.b_att.on else 0)) / 78.0 * 255, 0, 255).astype(np.uint8)
 
     # ----------------------------------------------------------------- audio
+    def bg_audio(self, syn, n):
+        if self.world.t < getattr(self, "burst_until", 0):
+            return syn.fsk("hfdsc", n, 100, 1700.0, 170.0) * 0.5
+        return None
+
     def audio(self, syn, n):
         if self.tx:
             return syn.alarm("hfal", n) * 0.3 if self.b_alarm.on else None
@@ -474,7 +520,18 @@ class HF(Station):
         for st, p, dm in self.active[:3]:
             g = min(1.0, 10 ** ((p["snr"] - 16) / 20.0)) * 1.4
             k, key = dm["kind"], "h" + st["key"]
-            if k == "voice":
+            clip, pos = self.voice_pos(st) if k == "voice" else (None, 0)
+            if clip is not None:
+                cur = st.get("_cur")
+                if cur is None or abs(cur - pos) > SR * 0.3:
+                    cur = pos
+                st["_cur"] = cur + n
+                z = chunk(clip, cur, n)
+                f = (3000.0 + dm["shift"]) if dm["inv"] else dm["shift"]
+                ph = st.get("_ph2", 0.0) + 2 * np.pi * f / SR * np.arange(1, n + 1)
+                st["_ph2"] = float(ph[-1] % (2 * np.pi))
+                a = ((np.conj(z) if dm["inv"] else z) * np.exp(1j * ph)).real * 1.3
+            elif k == "voice":
                 a = syn.voice(key, n, dm["shift"], dm["inv"]) * 1.5
             elif k == "fax":
                 a = syn.fax(key, n, dm["shift"])
@@ -549,8 +606,7 @@ class HF(Station):
         ui.led(s, (674, 206), "red", self.tx and self.po > 1, "ON AIR", 5)
         ui.led(s, (674, 224), "amber", (self.tx or bool(self.tuning_until)) and self.swr > 3, "HI SWR", 5)
         # spectrum
-        r = pygame.Rect(36, 420, 896, 130)
-        pygame.draw.rect(s, (4, 8, 12), r)
+        r = ui.crt(s, (36, 420, 896, 130), (3, 7, 10), (20, 40, 60))
         lo, hi = PASS[self.mode.value]
         rit = self.rit.val / 1000.0
         x0 = r.x + (lo + rit + SPAN / 2) / SPAN * r.w
@@ -559,7 +615,7 @@ class HF(Station):
         for i in range(-12, 13, 2):
             x = r.x + (i + SPAN / 2) / SPAN * r.w
             pygame.draw.line(s, (26, 36, 44), (x, r.y), (x, r.bottom), 1)
-            text(s, "%g" % (self.f + i), (x, 832), 10, C["dim"], align="c")
+            ui.legend(s, "%g" % (self.f + i), (x, 836), 10)
         for db in (-120, -100, -80, -60):
             y = r.bottom - (db + 132) / 100.0 * r.h
             pygame.draw.line(s, (26, 36, 44), (r.x, y), (r.right, y), 1)
@@ -570,11 +626,10 @@ class HF(Station):
         pygame.draw.line(s, C["red"], (cxm, r.y), (cxm, r.bottom), 1)
         text(s, "DIAL (carrier)", (cxm + 4, r.y + 2), 9, C["red"], bold=True)
         text(s, "PASSBAND", (x0 + 2, r.bottom - 12), 9, C["green"], bold=True)
-        pygame.draw.rect(s, C["edge"], r, 1)
+        ui.crt(s, (36, 556, 896, WH * 2), (2, 3, 8), (16, 24, 60), gain=110)
         pygame.surfarray.blit_array(self.wsurf, self.wf)
         s.blit(pygame.transform.scale(self.wsurf, (896, WH * 2)), (36, 556))
         pygame.draw.line(s, C["red"], (cxm, 556), (cxm, 556 + WH * 2), 1)
-        pygame.draw.rect(s, C["edge"], (36, 556, 896, WH * 2), 1)
         for st, p in self.sigs:
             x = r.x + (st["f"] - self.f + SPAN / 2) / SPAN * r.w
             if r.x + 40 < x < r.right - 40 and p["snr"] > 3:
@@ -607,8 +662,7 @@ class HF(Station):
             day = [w.hf_path(st0["lat"], st0["lon"], 8000, st0["pkw"], utc_h=hh)["muf"] for hh in range(25)]
             self._pred = (fs, cur, day, [w.hf_path(st["lat"], st["lon"], st["f"], st["pkw"]) for st in sts])
         fs, cur, day, own = self._pred
-        r = pygame.Rect(1012, 290, 560, 110)
-        pygame.draw.rect(s, (4, 8, 12), r)
+        r = ui.crt(s, (1012, 290, 560, 110), (3, 7, 10), (20, 40, 60))
 
         def fx(f):
             return r.x + (f - 1.6) / 24.4 * r.w
@@ -617,15 +671,15 @@ class HF(Station):
             return r.bottom - max(0, min(1, s_units(dbm) / 15.0)) * r.h
 
         muf = cur[0]["muf"]
-        pygame.draw.rect(s, (60, 18, 18), (fx(min(26, muf)), r.y, r.right - fx(min(26, muf)), r.h))
+        pygame.draw.rect(s, (34, 8, 8), (fx(min(26, muf)), r.y, r.right - fx(min(26, muf)), r.h))
         for sv, lab in ((1, "S1"), (5, "S5"), (9, "S9"), (12.33, "+20")):
             y = r.bottom - sv / 15.0 * r.h
             pygame.draw.line(s, (26, 36, 44), (r.x, y), (r.right, y), 1)
-            text(s, lab, (r.x - 4, y - 6), 9, C["dim"], align="r")
+            text(s, lab, (r.x - 9, y - 6), 9, C["dim"], align="r")
         for f in (2, 4, 6, 8, 12, 16, 22):
             pygame.draw.line(s, (26, 36, 44), (fx(f), r.y), (fx(f), r.bottom), 1)
-            text(s, "%d" % f, (fx(f), r.bottom + 2), 9, C["dim"], align="c")
-        text(s, "MHz", (r.right - 2, r.bottom + 2), 9, C["dim"], align="r")
+            text(s, "%d" % f, (fx(f), r.bottom - 12), 9, (90, 130, 150), align="c")
+        text(s, "MHz", (r.right - 4, r.bottom - 12), 9, (90, 130, 150), align="r")
         pygame.draw.lines(s, (150, 70, 70), False, [(fx(f), sy(p["noise"])) for f, p in zip(fs, cur)], 1)
         pygame.draw.lines(s, C["green"], False, [(fx(f), sy(p["pr"])) for f, p in zip(fs, cur)], 2)
         if muf < 26:
@@ -636,13 +690,11 @@ class HF(Station):
             pygame.draw.circle(s, C["yellow"], (x, y), 4)
             if best is None or p["snr"] > best[1]["snr"]:
                 best = (st, p)
-        pygame.draw.rect(s, C["edge"], r, 1)
         p0 = cur[0]
         text(s, "%d km  brg %03d°  %s  foF2 %.1f  %s" % (p0["d"], p0["brg"], "DAY PATH" if p0["day"] > 0 else "NIGHT PATH", p0["fof2"],
              "SSN %d" % w.ssn), (r.x, 270), 10, C["text"])
         # 24 h MUF strip
-        r2 = pygame.Rect(1012, 432, 560, 50)
-        pygame.draw.rect(s, (4, 8, 12), r2)
+        r2 = ui.crt(s, (1012, 436, 560, 46), (3, 7, 10), (20, 40, 60))
         mx = 30.0
         pts = [(r2.x + hh / 24.0 * r2.w, r2.bottom - min(1, m / mx) * r2.h) for hh, m in enumerate(day)]
         pygame.draw.polygon(s, (24, 60, 44), pts + [(r2.right, r2.bottom), (r2.x, r2.bottom)])
@@ -650,11 +702,10 @@ class HF(Station):
         x = r2.x + (w.utc_h % 24) / 24.0 * r2.w
         pygame.draw.line(s, C["yellow"], (x, r2.y), (x, r2.bottom), 2)
         for hh in range(0, 25, 6):
-            text(s, "%02d" % (hh % 24), (r2.x + hh / 24.0 * r2.w, r2.bottom + 1), 9, C["dim"], align="c")
+            text(s, "%02d" % (hh % 24), (r2.x + 10 + hh / 24.0 * (r2.w - 20), r2.bottom + 8), 9, C["dim"], align="c")
         text(s, "MUF over 24 h UTC (max %d MHz)" % max(day), (r2.x + 4, r2.y + 2), 9, C["dim"], bold=True)
-        pygame.draw.rect(s, C["edge"], r2, 1)
-        text(s, "30", (r2.x - 4, r2.y - 2), 9, C["dim"], align="r")
+        text(s, "30", (r2.x - 9, r2.y - 2), 9, C["dim"], align="r")
         if best:
             st, p = best
             col = C["green"] if p["snr"] > 12 else (C["amber"] if p["snr"] > 4 else C["red"])
-            text(s, "BEST NOW: %g kHz  %s  SNR %d dB  %s" % (st["f"], s_text(p["pr"]), p["snr"], p["mode"]), (1012, 414), 11, col, bold=True)
+            text(s, "BEST NOW: %g kHz  %s  SNR %d dB  %s" % (st["f"], s_text(p["pr"]), p["snr"], p["mode"]), (1012, 412), 11, col, bold=True)

@@ -37,7 +37,33 @@ Workflow artifacts are retained for 30 days.
 
 Python 3.9+. `pygame-ce` is recommended; classic `pygame` 2.x also works.
 The window is 1600x900 and scales when resized (F11 = full screen).
-All sound is synthesised live - there are no asset files.
+There are no asset files: the artwork is rendered and the sound synthesised
+when the program starts.
+
+## Look and sound
+
+The console is drawn as physical 1980s hardware without a 3D engine.
+`radarsim/fx.py` describes each part (panel plate, fluted knob, bar-pointer
+switch, legend push-button, jewelled lamp, guarded distress button, display
+bezel, PPI housing) as a small height map plus a material and lights it once
+with a fixed lamp above the console (Lambert + specular), then caches the
+result as an ordinary 2D sprite. Knobs are rendered per angle, so flutes and
+pointer rotate while the highlights stay where the lamp puts them. CRT and
+display faces are drawn live every frame and then given phosphor bloom, scan
+lines, a shadow mask from the bezel and a glass reflection. Interaction is
+entirely 2D.
+
+Radio voices are real speech: eSpeak NG (bundled by the `espeakng-loader`
+package, no system install) speaks each message with a per-station voice,
+and the result is band-limited and compressed like a communications
+transmitter. On HF the clip is kept as an analytic signal so tuning error
+produces a true SSB pitch shift and the wrong sideband really inverts the
+speech. Without the package the radios fall back to captions only.
+
+Everything else makes a sound too: detents, rotary switches, button caps,
+the distress cover, T/R and tuner relays, squelch tails, DSC and data
+bursts, DTMF, the printer, alarms, cooling fans, the scanner motor and the
+modulator singing at the PRF. F10 mutes.
 
 | Key | Action |
 | --- | --- |
@@ -103,6 +129,7 @@ abandon-ship capstone that uses every station.
 **F8 REFERENCE** - GMDSS frequencies, voice procedure, radar and radio theory,
 satellite systems.
 
+![VHF and DSC](docs/vhf.png)
 ![MF/HF](docs/hf.png)
 ![Circuits](docs/circuits.png)
 ![COSPAS-SARSAT](docs/sarsat.png)
@@ -130,6 +157,7 @@ and not a substitute for the equipment manuals or an approved GOC/ROC course.
 radarsim/
   main.py       window, tabs, audio mixing        world.py     ships, coast, traffic, propagation, orbits
   ui.py         knobs, switches, meters, LCDs     audio.py     real-time sound synthesis
+  fx.py         lit hardware sprites, CRT glass   speech.py    spoken radio traffic (eSpeak NG)
   radar.py      F1    vhf.py       F2             hf.py        F3
   satcom.py     F4    sarsat.py    F5             bench.py     F6
   training.py   F7    reference.py F8             worldmap.py, radiocore.py   shared helpers

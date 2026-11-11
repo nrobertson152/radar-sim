@@ -9,7 +9,7 @@ decaying 'phosphor' buffer by the rotating sweep.
 import math
 import numpy as np
 import pygame
-from . import ui
+from . import ui, fx
 from .ui import C, text, Knob, Selector, Button, Station
 from .world import wrap180
 
@@ -143,28 +143,40 @@ class Radar(Station):
         self.Ef, self.Tf = self.E.reshape(-1), self.T.reshape(-1)
         self.surf = pygame.Surface((D, D), 0, 8)
         pal = []
-        bg = np.array([3, 12, 16.0])
-        for i in range(256):
+        bg = np.array([2, 9, 6.0])
+        for i in range(256):                      # P7-style phosphor: white-hot flash, green afterglow
             e, t = (i & 63) / 63.0, (i >> 6) / 3.0
-            col = bg + np.array([20, 60, 150.0]) * t * 0.8
-            col = col * (1 - e ** 0.6) + np.array([255, 236, 70.0]) * e ** 0.75
-            pal.append(tuple(int(min(255, v)) for v in col))
+            col = bg + np.array([10, 46, 74.0]) * t * 0.9
+            glow = np.array([30, 235, 96.0]) * e ** 0.85 + np.array([150, 20, 90.0]) * e ** 4.0
+            pal.append(tuple(int(min(255, v)) for v in col * (1 - e ** 0.7) + glow))
         self.surf.set_palette(pal)
-        # bezel with bearing scale
-        bz = self.bezel = pygame.Surface((768, ui.BOT - ui.TOP), pygame.SRCALPHA)
-        bz.fill(C["bg"])
+        # cast housing with a raised, edge-lit bearing ring
+        hw, hh = 768, ui.BOT - ui.TOP
         cx, cy = self.CX, self.CY - ui.TOP
-        pygame.draw.circle(bz, (26, 29, 34), (cx, cy), R + 36)
-        pygame.draw.circle(bz, C["edge"], (cx, cy), R + 36, 1)
-        pygame.draw.circle(bz, (0, 0, 0, 0), (cx, cy), R)
+        bz = fx.radar_housing(hw, hh, cx, cy, R, ui.TOP).copy()
+        lay = pygame.Surface((hw, hh), pygame.SRCALPHA)
+        ink = (255, 214, 150)
         for d in range(0, 360):
             a = math.radians(d)
-            ln = 12 if d % 10 == 0 else (8 if d % 5 == 0 else 4)
-            pygame.draw.line(bz, C["text"], (cx + math.sin(a) * (R + 2), cy - math.cos(a) * (R + 2)),
-                             (cx + math.sin(a) * (R + 2 + ln), cy - math.cos(a) * (R + 2 + ln)), 1)
+            ln = 11 if d % 10 == 0 else (7 if d % 5 == 0 else 4)
+            pygame.draw.line(lay, ink, (cx + math.sin(a) * (R + 9), cy - math.cos(a) * (R + 9)),
+                             (cx + math.sin(a) * (R + 9 + ln), cy - math.cos(a) * (R + 9 + ln)), 2 if d % 10 == 0 else 1)
             if d % 30 == 0:
-                text(bz, "%03d" % d, (cx + math.sin(a) * (R + 25), cy - math.cos(a) * (R + 25)),
-                     11, C["text"], bold=True, align="m")
+                text(lay, "%03d" % d, (cx + math.sin(a) * (R + 27), cy - math.cos(a) * (R + 27)),
+                     10, ink, bold=True, align="m")
+        soft = pygame.transform.smoothscale(pygame.transform.smoothscale(lay, (hw // 4, hh // 4)), (hw, hh))
+        soft.fill((255, 120, 40, 150), special_flags=pygame.BLEND_RGBA_MULT)
+        bz.blit(soft, (0, 0))
+        bz.blit(lay, (0, 0))
+        for i, (px, py) in enumerate(((16, 130), (752, 130), (16, 700), (752, 700), (384, 14), (384, hh - 14))):
+            sc = fx.screw(i)
+            bz.blit(sc, (px - 6, py - 6))
+        flat = pygame.Surface((hw, hh))
+        flat.fill((255, 0, 255))
+        flat.blit(bz, (0, 0))
+        flat = fx._fast(flat)
+        flat.set_colorkey((255, 0, 255), pygame.RLEACCEL)     # tube opening: fast colour-keyed hole
+        self.bezel = flat
 
     def clear(self):
         self.E[:] = 0
@@ -229,6 +241,7 @@ class Radar(Station):
                     elif tr:
                         self.sel = tr
                     elif len(self.tracks) < 10:
+                        ui.sfx("acquire")
                         self.sel = dict(c=best, t0=self.world.t, n=1 + max([t["n"] for t in self.tracks] + [0]))
                         self.tracks.append(self.sel)
                 return True
@@ -260,6 +273,11 @@ class Radar(Station):
             self.warm = 20.0
         elif self.warm > 0 and h["psu"]:
             self.warm -= dt
+            if self.warm <= 0:
+                ui.sfx("warm")
+        if self.transmitting != getattr(self, "_was_tx", False):
+            self._was_tx = self.transmitting
+            ui.sfx("relay", 1.0)
         w.hdg, w.spd, w.sea = self.hdg.val % 360, self.spd.val, int(self.sea.val)
         w.interference = self.int_b.on
         if self.rain_b.pop():
@@ -337,6 +355,21 @@ class Radar(Station):
                 azt = (azr + w.hdg) % 360
                 self.paint(azt, azr)
             self.ang = new % 360
+
+    def bg_audio(self, syn, n):
+        """Transformer hum, scanner motor, the modulator singing at the PRF, alarms."""
+        k = 1.0 if self.app.station is self else 0.3
+        out = None
+        if self.power.value != "OFF" and self.world.rh["psu"]:
+            out = syn.osc("rxf", 100.0, n) * 0.005 * k
+            if self.transmitting:
+                if self.world.rh["ant"]:
+                    out = out + (syn.rumble("rmot", n, 26) * 0.05 + syn.osc("rmot2", 87.0, n) * 0.012) * k
+                if self.tx_ok:
+                    out = out + syn.whine("prf", PULSES[self.pulse.value][1], n) * 0.012 * k
+        if self.cpa_alarm:
+            out = (0 if out is None else out) + syn.beep("cpa", n, 2300.0, 3.0) * 0.3
+        return out
 
     def paint(self, azt, azr):
         v = self.ray(azt, azr)
@@ -469,16 +502,16 @@ class Radar(Station):
             pygame.surfarray.blit_array(self.surf, e)
             s.blit(self.surf, (cx - R, cy - R))
         else:
-            pygame.draw.circle(s, (3, 12, 16) if on else (2, 3, 4), (cx, cy), R)
+            pygame.draw.circle(s, (2, 9, 6) if on else (5, 8, 7), (cx, cy), R)
         if on:
-            dim = tuple(int(c * min(1, self.brill.val)) for c in (40, 110, 90))
+            dim = tuple(int(c * min(1, self.brill.val)) for c in (24, 96, 52))
             if self.rings.on:
                 n = int(round(self.rmax / RINGS[self.rmax]))
                 for i in range(1, n + 1):
                     pygame.draw.circle(s, dim, (cx, cy), int(R * i / n), 1)
             if not self.hl.down:
                 p = self.to_xy(self.rmax, w.hdg)
-                pygame.draw.line(s, (120, 255, 190), (cx, cy), p, 1)
+                pygame.draw.line(s, (90, 255, 150), (cx, cy), p, 1)
             if not self.nup.on:
                 a = math.radians(-w.hdg)
                 pygame.draw.polygon(s, C["cyan"], [(cx + math.sin(a) * (R - 2), cy - math.cos(a) * (R - 2)),
@@ -500,7 +533,7 @@ class Radar(Station):
                 self._draw_tracks(s)
                 if h["trig"]:
                     a = math.radians(self.ang + w.hdg - self.rot)
-                    pygame.draw.line(s, (60, 140, 110), (cx, cy), (cx + math.sin(a) * R, cy - math.cos(a) * R), 1)
+                    pygame.draw.line(s, (70, 200, 110), (cx, cy), (cx + math.sin(a) * R, cy - math.cos(a) * R), 2)
                 if self.sol_b.on:
                     for c, rng, brg in self.tinfo:
                         if rng < self.rmax:
@@ -514,28 +547,36 @@ class Radar(Station):
                 text(s, msg, (cx, cy - 40), 34, (120, 255, 190), bold=True, align="m")
                 if self.power.value == "TX" and self.warm > 0:
                     text(s, "TX INHIBITED UNTIL MAGNETRON IS WARM", (cx, cy + 10), 14, C["amber"], bold=True, align="m")
+        pr = pygame.Rect(cx - R, cy - R, self.D, self.D)
+        if on:
+            fx.bloom(s, pr, 170)
         s.blit(self.bezel, (0, ui.TOP))
+        mult, add = fx.round_glass(R)
+        s.blit(mult, pr, special_flags=pygame.BLEND_RGB_MULT)
+        s.blit(add, pr, special_flags=pygame.BLEND_RGB_ADD)
+        for wr in ((12, 52, 170, 60), (598, 52, 158, 60), (12, 820, 200, 40), (588, 820, 168, 40)):
+            ui.lcd(s, wr)
         if on:
             g = (120, 255, 190)
             tau, prf, _, _ = PULSES[self.pulse.value]
-            text(s, "RANGE %g NM" % self.rmax, (14, 54), 16, g, bold=True)
-            text(s, "RINGS %g NM" % RINGS[self.rmax], (14, 76), 13, g)
-            text(s, "%s-BAND  %s" % (self.band.value[0], self.pulse.value[0] + "P"), (14, 94), 13, g)
-            text(s, "N UP  RM" if self.nup.on else "H UP  RM", (754, 54), 16, g, bold=True, align="r")
-            text(s, "HDG %05.1f°" % w.hdg, (754, 76), 13, g, align="r")
-            text(s, "SPD %4.1f kn" % w.spd, (754, 94), 13, g, align="r")
+            text(s, "RANGE %g NM" % self.rmax, (20, 56), 15, g, bold=True)
+            text(s, "RINGS %g NM" % RINGS[self.rmax], (20, 76), 12, g)
+            text(s, "%s-BAND  %s" % (self.band.value[0], self.pulse.value[0] + "P"), (20, 92), 12, g)
+            text(s, "N UP  RM" if self.nup.on else "H UP  RM", (750, 56), 15, g, bold=True, align="r")
+            text(s, "HDG %05.1f°" % w.hdg, (750, 76), 12, g, align="r")
+            text(s, "SPD %4.1f kn" % w.spd, (750, 92), 12, g, align="r")
             if self.ebl_on.on:
                 rel = (self.ebl.val - w.hdg) % 360
-                text(s, "EBL %05.1f°T  %05.1f°R" % (self.ebl.val, rel), (14, 822), 13, C["cyan"], bold=True)
+                text(s, "EBL %05.1f°T  %05.1f°R" % (self.ebl.val, rel), (18, 823), 12, C["cyan"], bold=True)
             if self.vrm_on.on:
-                text(s, "VRM %6.3f NM" % (self.vrm.val * self.rmax), (14, 842), 13, C["cyan"], bold=True)
+                text(s, "VRM %6.3f NM" % (self.vrm.val * self.rmax), (18, 840), 12, C["cyan"], bold=True)
             m = ui.MOUSE
             if math.hypot(m[0] - cx, m[1] - cy) < R:
                 rng, brg = self.from_xy(m)
-                text(s, "CURSOR %05.1f°T" % brg, (754, 822), 13, g, align="r")
-                text(s, "%6.3f NM" % rng, (754, 842), 13, g, align="r")
+                text(s, "CURSOR %05.1f°T" % brg, (750, 823), 12, g, align="r")
+                text(s, "%6.3f NM" % rng, (750, 840), 12, g, align="r")
             if self.cpa_alarm and int(w.t * 2) % 2:
-                text(s, "COLLISION ALARM - CPA/TCPA", (cx, 54), 15, C["red"], bold=True, align="c")
+                text(s, "COLLISION ALARM - CPA/TCPA", (cx, 50), 15, C["red"], bold=True, align="c")
 
         # panels
         ui.panel(s, (770, 52, 820, 150), "TRANSCEIVER")
@@ -594,16 +635,14 @@ class Radar(Station):
             text(s, str(t["n"]), (x + 11, y - 16), 11, col, bold=True)
 
     def _draw_ascan(self, s):
-        r = pygame.Rect(790, 552, 462, 262)
-        pygame.draw.rect(s, (4, 10, 12), r)
+        r = ui.crt(s, (792, 556, 458, 254))
         for i in range(1, 5):
             pygame.draw.line(s, (26, 42, 44), (r.x + r.w * i / 5, r.y), (r.x + r.w * i / 5, r.bottom), 1)
             pygame.draw.line(s, (26, 42, 44), (r.x, r.y + r.h * i / 5), (r.right, r.y + r.h * i / 5), 1)
-        pygame.draw.rect(s, C["edge"], r, 1)
         for i in range(6):
-            text(s, "%g" % (self.rmax * i / 5), (r.x + r.w * i / 5, r.bottom + 3), 10, C["dim"], align="c")
-        text(s, "nm", (r.right + 4, r.bottom + 3), 10, C["dim"])
-        text(s, "+80dB", (r.x - 2, r.y - 13), 9, C["dim"])
+            text(s, "%g" % (self.rmax * i / 5), (r.x + r.w * i / 5, r.bottom + 9), 10, C["dim"], align="c")
+        text(s, "nm", (r.right - 2, r.bottom + 9), 10, C["dim"], align="r") if False else None
+        text(s, "+80 dB", (r.x + 6, r.y + 4), 9, (60, 110, 80))
         if self.disp_ok and self.transmitting:
             vdb, v = self.ascan
             xs = r.x + (np.arange(self.NR) + 0.5) / self.NR * r.w
@@ -627,8 +666,8 @@ class Radar(Station):
         ui.led(s, (1100, 842), "cyan", True, "VRM", 4)
 
     def _draw_arpa(self, s):
-        x, y = 1294, 546
-        l = ui.lcd(s, (1290, 542, 288, 190))
+        x, y = 1296, 552
+        l = ui.lcd(s, (1292, 550, 284, 184))
         fg = C["lcdfg"]
         t = self.sel if self.sel in self.tracks else None
         if not t or "rng" not in t:
