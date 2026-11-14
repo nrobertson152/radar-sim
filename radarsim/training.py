@@ -7,10 +7,57 @@ from .ui import C, text, Button, Station
 from .world import HF_STATIONS, HF_RT, HF_DSC
 
 
+def _baseline(app):
+    """Clear power, sensor and instructor faults left over from free play, so
+    every drill starts from a healthy ship."""
+    w = app.world
+    p = getattr(app, "power", None)
+    if p is not None:
+        for t in (p.f_black, p.f_gen, p.f_weak, p.f_chg, p.f_earth):
+            t.set(False)
+        for b in p.brk.values():
+            b.set(True)
+        p.src.set(0)
+        p.gsel.set(0)
+        p.chg.set(1)
+        p.dim.set(1.0)
+        p.soc = max(p.soc, 0.9)
+        p.acked |= p.active
+    n = getattr(app, "nav", None)
+    if n is not None:
+        for t in (n.f_ant, n.f_jam, n.f_gyro, n.f_log, n.f_ais, n.dev_on, n.ais_silent):
+            t.set(False)
+        w.ais_device = None
+        for t in (n.gps_pwr, n.gy_pwr, n.gps_hold):
+            t.set(True)
+        n.gps_datum.set(0)
+        n.log_cal.set(0.0)
+        n.gy_lat.set(round(w.lat))
+        n.gy_spd.set(round(w.spd))
+        n.man = None
+        n.jam = 0.0
+        n.ack_gps |= n.alarms_gps
+        n.ack_ais |= n.alarms_ais
+        n.alarms_ais.discard("NEW SRM")
+    for st in ("vuhf", "hf", "navtex", "sat2"):
+        x = getattr(app, st, None)
+        if x is None:
+            continue
+        b = getattr(x, "pwr", None) if st != "hf" else x.pwr_b
+        if b is not None:
+            b.on = True
+    app.mistakes = []
+
+
 def _radar_ready(app, **kw):
     r, w = app.radar, app.world
     r.power.set(2)
     r.last_power, r.warm = "TX", 0.0
+    r.spin = 1.0
+    r.gz_b.on = r.ais_b.on = r.pm_b.on = False
+    r.gz_alarm = r.lost_alarm = r.hdg_alarm = False
+    r.vect_rel, r.vmin_i, r.ais_sel = False, 1, None
+    r.nup.on = False
     r.afc.on = True
     r.tune.set(0.5)
     r.gain.set(0.65)
@@ -30,6 +77,10 @@ def _radar_ready(app, **kw):
     r.tracks, r.sel, r.cpa_alarm = [], None, False
     r.clear()
     app.bench.repair("R")
+    n = getattr(app, "nav", None)
+    if n is not None:
+        n.gy_spd.set(round(kw.get("spd", 10.0)))
+        n.gy_lat.set(round(w.lat))
 
 
 def _place(app, name, rng, brg, cog=None, sog=None):
@@ -163,6 +214,9 @@ def build():
         v.pwr.on = True
         v.sql.set(0.3)
         v.hilo.on = False
+        v.scan.on = False
+        v.incoming = None
+        v.comp.items, v.comp.debrief = [], None
 
     def s6(app):
         v_clean(app)
@@ -350,6 +404,291 @@ def build():
             ("EPIRB: switch ON", lambda a: a.sarsat.active),
             ("SART: switch ON", lambda a: a.sarsat.sart.value == "ON"),
         ]))
+
+    # ======================================================= new systems
+    def s17(app):
+        _radar_ready(app, sea=1, spd=0.0, ri=5)
+        c = _place(app, "FV MORVORAN", 3.7, 200, 20, 18)
+        c.box = (-60, 60, -60, 60)
+    D.append(Drill("Radar 6: guard zone alarm", "RADAR",
+        "A fishing vessel is closing from the south-south-west. Put a guard zone round the ship at 3 NM so the "
+        "radar warns you of anything that comes inside - set the VRM first, the zone runs 0.5 NM out from it.",
+        s17, [
+            ("Set the VRM to about 3 NM, then switch GUARD ZONE on", lambda a: a.radar.gz_b.on and 2.5 <= (a.radar.gz_r0 or 0) <= 3.5),
+            ("Wait for the GUARD ZONE alarm as the vessel runs in", lambda a: "gz_alarm" in a.radar.flags),
+            ("Acknowledge it (ALARM ACK)", lambda a: not a.radar.gz_alarm and "alarm_ack" in a.radar.flags),
+            ("Acquire the fishing vessel with ARPA", lambda a: any(t["c"].name == "FV MORVORAN" for t in a.radar.tracks)),
+        ]))
+
+    def s18(app):
+        _radar_ready(app, sea=1, spd=0.0, ri=4)
+        _place(app, "SY KITTIWAKE", 1.6, 320, 0, 0)
+        _place(app, "PENHALE FERRY", 2.2, 40, 150, 12).box = (-60, 60, -60, 60)
+    D.append(Drill("Radar 7: AIS and radar together", "RADAR",
+        "AIS shows where targets SAY they are, a few seconds late; radar shows what is there now. A small yacht "
+        "without AIS is near you. Use both.",
+        s18, [
+            ("Switch the AIS overlay on (ARPA panel)", lambda a: a.radar.ais_b.on),
+            ("Click an AIS triangle and read its MMSI and call sign", lambda a: a.radar.ais_sel is not None),
+            ("Acquire the echo that has NO AIS symbol - the yacht", lambda a: any(t["c"].name == "SY KITTIWAKE" for t in a.radar.tracks)),
+            ("Change to RELATIVE vectors", lambda a: getattr(a.radar, "vect_rel", False)),
+        ]))
+
+    def s19(app):
+        _radar_ready(app, sea=1, spd=10.0, ri=5, hdg=5.0)
+        n = app.nav
+        n.gy_spd.set(25)
+        n.gy_lat.set(70)
+        n.log_cal.set(6.0)
+    D.append(Drill("Sensors 1: gyro and log errors", "NAV SENSORS / AIS",
+        "The gyro's speed and latitude corrections have been left wrong and the speed log is out of calibration. "
+        "Every radar bearing is turned by the gyro error and ARPA's true vectors are wrong. Correct them.",
+        s19, [
+            ("Open the NAV / AIS tab and read the gyro ERROR", lambda a: a.station is a.nav),
+            ("Set SPEED CORR to the ship's speed and LAT CORR to her latitude (error under 0.2°)", lambda a: abs(a.nav.gyro_error()) < 0.2),
+            ("Set the speed log CAL to 0 %", lambda a: abs(a.nav.log_cal.val) < 0.3),
+            ("On the RADAR tab check that ARPA shows no gyro or log warning", lambda a: a.station is a.radar and abs(a.radar.gerr) < 0.3),
+        ]))
+
+    def s20(app):
+        app.nav.f_ant.set(True)
+    D.append(Drill("Sensors 2: GPS failure - manual DSC position", "NAV SENSORS / AIS",
+        "The GPS antenna has failed. Without a position every DSC distress alert goes out with the 'position "
+        "unknown' code. Enter the position by hand - and remember to update it.",
+        s20, [
+            ("Watch the GPS lose its fix (NO FIX)", lambda a: a.nav.fix == "NO FIX"),
+            ("Acknowledge the GPS alarm", lambda a: "NO FIX" in a.nav.ack_gps),
+            ("Set the position wheels (LOAD DR copies the chart position) and press ENTER", lambda a: a.nav.man is not None),
+            ("Check the VHF DSC position source now reads MANUAL", lambda a: a.station is a.vuhf and (a.dsc_position() or (0, 0, ""))[2] == "MANUAL"),
+        ]))
+
+    def s21(app):
+        n = app.nav
+        n.dev_sel.set(0)
+        n.dev_on.set(True)
+        n._dev_idx = -1
+    D.append(Drill("Sensors 3: AIS-SART detected", "NAV SENSORS / AIS",
+        "An AIS-SART (MMSI 970...) has been switched on in a liferaft nearby. It shows on the AIS display and the "
+        "radar AIS overlay as a red circle with a cross.",
+        s21, [
+            ("Acknowledge the AIS-SART alarm on the MKD", lambda a: "ais_ack" in a.nav.flags and "ais_sart_seen" in a.nav.flags),
+            ("Select it in TARGETS (cursor) and open DETAIL with ENT", lambda a: str(a.nav.sel_mmsi or "").startswith("970") and a.nav.page == "DETAIL"),
+            ("On the RADAR tab switch the AIS overlay on and find it", lambda a: a.station is a.radar and a.radar.ais_b.on),
+        ]))
+
+    def s22(app):
+        nt = app.navtex
+        for b in list(nt.b1.values()) + list(nt.b2.values()):
+            b.on = True
+        nt.flags.clear()
+        nt.freq.set(0)
+    D.append(Drill("NAVTEX: set up the receiver", "NAVTEX RECEIVER",
+        "Select the stations and subjects you need. Distant transmitters only waste paper - but some subjects "
+        "can never be switched off.",
+        s22, [
+            ("Deselect B1 stations L (NORTHSEA) and O (KERNVIK) - too far away", lambda a: not a.navtex.b1["L"].on and not a.navtex.b1["O"].on),
+            ("Try to reject subject D (SAR) and see why you cannot", lambda a: "tried_reject" in a.navtex.flags),
+            ("Reject subject H (LORAN messages)", lambda a: not a.navtex.b2["H"].on),
+            ("Run a SELF TEST", lambda a: "self_test" in a.navtex.flags),
+            ("Receive a message, select it and READ it", lambda a: a.navtex.page == "TEXT" and bool(a.navtex.mem)),
+        ]))
+
+    def s23(app):
+        nt = app.navtex
+        nt.flags.clear()
+        nt.d_alarm.set(True)
+        nt.b_inj.click()
+    D.append(Drill("NAVTEX: SAR message alarm", "NAVTEX RECEIVER",
+        "A SAR message (subject D) with serial 00 is broadcast: it is always printed and sounds the alarm.",
+        s23, [
+            ("Wait for the SAR alarm", lambda a: "sar_rx" in a.navtex.flags),
+            ("Silence it (ALARM OFF)", lambda a: "alarm_ack" in a.navtex.flags),
+            ("READ the message on the display", lambda a: a.navtex.page == "TEXT" and a.navtex.mem and a.navtex.mem[0]["b2"] == "D"),
+        ]))
+
+    def s24(app):
+        v_clean(app)
+        app.vuhf.ch = 16
+        app.vuhf.nature.set(0)
+        app.vuhf.comp.items = []
+    def _mayday_ok(a):
+        c = a.vuhf.comp
+        if c.classify(c.keys) != "DISTRESS":
+            return False
+        _, chk, miss = c.evaluate(dict(keys=c.keys, all=c.keys, truncated=False, text=""))
+        return all(ok for ok, _, _ in chk)
+    D.append(Drill("VHF 4: compose and send a MAYDAY", "VHF / UHF",
+        "Your ship is sinking. Send the DSC alert, then build the complete MAYDAY call and message with the "
+        "MESSAGE COMPOSER and hold PTT until it has all been spoken. The coastguard answers what it heard.",
+        s24, [
+            ("Set NATURE OF DISTRESS to SINKING", lambda a: a.vuhf.nature.value == "SINKING"),
+            ("Send the DSC distress alert (lift, hold 3 s)", lambda a: "distress_sent" in a.vuhf.flags),
+            ("Compose the full call and message (MAYDAY x3 ... POB, OVER)", _mayday_ok),
+            ("Hold PTT on CH16 until the whole message is spoken", lambda a: "mayday_composed_ok" in a.vuhf.flags),
+        ]))
+
+    def s25(app):
+        v_clean(app)
+        w = app.world
+        app.vuhf.ch = 16
+        app.vuhf.incoming = None
+        w.say(70, w.srcs["CG"], "", 4.0, "dsc", dict(cat="INDIVIDUAL", ch=67, to=w.mmsi, text=(
+            "MV TRAINER, THIS IS PENHALE COASTGUARD ON CHANNEL 67. A DIVER IS REPORTED MISSING 2 MILES NORTH OF "
+            "YOU. PLEASE KEEP A LOOKOUT AND REPORT ANY SIGHTING. OVER.")))
+        w._next = w.t + 80
+    D.append(Drill("VHF 5: answer a DSC routine call", "VHF / UHF",
+        "The coastguard calls you by DSC instead of on channel 16. Accept the call, listen on the working channel "
+        "and reply.",
+        s25, [
+            ("Wait for the incoming individual call", lambda a: "indiv_rx" in a.vuhf.flags),
+            ("Press SILENCE / ACCEPT - the radio moves to CH67", lambda a: "indiv_accept" in a.vuhf.flags and a.vuhf.ch == 67),
+            ("Listen to the coastguard on CH67", lambda a: a.vuhf.flags.get("heard:PENHALE COASTGUARD", 0) > a.vuhf.flags.get("indiv_accept", 1e9)),
+            ("Reply with PTT (2 s or more)", lambda a: "work_voiced" in a.vuhf.flags),
+        ]))
+
+    def s26(app):
+        v_clean(app)
+        app.vuhf.ch = 16
+        app.vuhf.comp.items = []
+    D.append(Drill("VHF 6: SECURITE broadcast", "VHF / UHF",
+        "You have passed a large container floating just awash. Warn all ships: DSC safety announcement, then "
+        "SECURITE x3, ALL STATIONS x3, THIS IS, name x3, the hazard, its position, OUT.",
+        s26, [
+            ("Send the DSC ALL SHIPS SAFETY announcement", lambda a: "allships_safety" in a.vuhf.flags),
+            ("Compose and send the SECURITE message on CH16", lambda a: "securite_voiced" in a.vuhf.flags),
+        ]))
+
+    def s27(app):
+        h_clean(app)
+        h = app.hf
+        bst = max((st for st in HF_STATIONS if st["name"] == "NORTHSEA RADIO"), key=lambda st: app.world.hf_rx(st)["snr"])
+        h.set_freq(bst["f"])
+        h.mode.set(0)
+        h.agc = "OFF"
+        h.nb_b.on = False
+        h.rf.set(1.0)
+    D.append(Drill("HF 4: static, AGC and the noise blanker", "MF / HF SSB",
+        "Atmospheric static crashes are spoiling the copy and the AGC is off, so the strong station overloads "
+        "the receiver. Set the receiver up properly.",
+        s27, [
+            ("Set AGC to SLOW (for SSB voice)", lambda a: a.hf.agc == "SLOW"),
+            ("Switch the NOISE BLANKER on", lambda a: a.hf.nb_b.on),
+            ("Copy 40 characters from NORTHSEA RADIO", lambda a: a.hf.flags.get("copy:NORTHSEA RADIO", 0) >= 40),
+        ]))
+
+    def s28(app):
+        s12(app)
+        s = app.satcom
+        s.region.set(1)
+        az, el, _ = s.look()
+        s.az.set((az + 25) % 360)
+        s.el.set(max(0, el - 12))
+        s.b_peak.on = False
+    D.append(Drill("Inmarsat 2: point the dish by ear", "INMARSAT",
+        "Point the Fleet dish using only the PEAK TONE - no SHOW SOLUTION. Then lock, log in and prove the "
+        "terminal with a link test.",
+        s28, [
+            ("Switch PEAK TONE on", lambda a: a.satcom.b_peak.on),
+            ("Point the dish by ear: C/N0 above 50 dB-Hz without SHOW SOLUTION", lambda a: a.satcom.cn0 > 50 and not a.satcom.b_sol.on),
+            ("Engage AUTO TRACK and LOG IN", lambda a: a.satcom.tracking and a.satcom.logged),
+            ("Run a LINK TEST (PVT)", lambda a: "pvt" in a.satcom.flags),
+        ]))
+
+    def _satc_up(app):
+        s = app.satcom
+        s.region.set(1)
+        s._reg = s.region.value
+        az, el, _ = s.look()
+        s.az.set(round(az * 2) / 2)
+        s.el.set(round(el * 2) / 2)
+        s.logged, s.busy = s.sat[0], None
+
+    def s29(app):
+        _satc_up(app)
+        q = app.sat2
+        q.flags.clear()
+        q.ssas = None
+        q.ssas_mode.set(1)
+        q.lrit_on.set(True)
+    D.append(Drill("SATCOM 2: SSAS test and LRIT", "SATCOM 2",
+        "Test the Ship Security Alert System as agreed with the company security officer, and send an LRIT test "
+        "report. SSAS goes out silently through Inmarsat-C.",
+        s29, [
+            ("Check SSAS MODE is TEST", lambda a: a.sat2.ssas_mode.value == "TEST"),
+            ("Lift the cover of an SSAS button and hold it 2 s", lambda a: "ssas_test" in a.sat2.flags),
+            ("Wait for the CSO's confirmation (printed on the Inmarsat-C printer)", lambda a: "ssas_test_ack" in a.sat2.flags),
+            ("RESET the SSAS", lambda a: a.sat2.ssas is None),
+            ("Send an LRIT TEST report", lambda a: "lrit_test" in a.sat2.flags),
+        ]))
+
+    def s30(app):
+        q = app.sat2
+        q.flags.clear()
+        q.distress = None
+        q.nature.set(0)
+    D.append(Drill("SATCOM 2: Iridium distress alert", "SATCOM 2",
+        "Alert by Iridium: it works everywhere, including the polar regions (Sea Area A4). The rescue "
+        "co-ordination centre acknowledges and calls you back by voice.",
+        s30, [
+            ("Wait until the terminal is REGISTERED", lambda a: a.sat2.registered),
+            ("Set NATURE to FLOODING", lambda a: a.sat2.nature.value == "FLOODING"),
+            ("Lift the cover and hold DISTRESS 3 s", lambda a: "ir_distress" in a.sat2.flags),
+            ("Wait for the RCC acknowledgement and voice call", lambda a: "ir_distress_acked" in a.sat2.flags),
+        ]))
+
+    def s31(app):
+        app.power.test_res = None
+        app.power.flags.clear()
+    D.append(Drill("Power 1: daily battery check", "RADIO POWER",
+        "Every day: read the radio battery voltage off load and on load, and check the insulation. Log the results.",
+        s31, [
+            ("Hold ON-LOAD TEST for at least 2 s", lambda a: "load_test" in a.power.flags),
+            ("Check the result passed (above 24 V on load)", lambda a: bool(a.power.test_res and a.power.test_res["ok"])),
+            ("Run the INSULATION TEST", lambda a: "ins_test" in a.power.flags),
+        ]))
+
+    def s32(app):
+        _radar_ready(app)
+        p = app.power
+        p.flags.clear()
+        p.f_black.set(True)
+        _satc_up(app)
+        app.satcom.b_auto.on = True
+    D.append(Drill("Power 2: blackout", "RADIO POWER",
+        "The main switchboard has failed. The GMDSS radios carry on from the battery; the emergency generator "
+        "starts; the radar and the Fleet dish (AC only) go down and must be restarted.",
+        s32, [
+            ("Acknowledge the power alarms", lambda a: "alarm_ack" in a.power.flags),
+            ("Watch the emergency generator start and take the AC load", lambda a: a.power.gen == "RUN"),
+            ("Restart the radar: it lost power (STBY, warm-up, TX)", lambda a: a.radar.transmitting),
+            ("Re-engage the Fleet dish AUTO TRACK on the INMARSAT tab", lambda a: a.satcom.tracking),
+        ]))
+
+    def s33(app):
+        v_clean(app)
+        app.power.brk["VHF"].set(True)
+        app.power.brk["VHF"].trip()
+    D.append(Drill("Power 3: tripped breaker", "ALL STATIONS",
+        "The VHF has died. Check the obvious first: is it getting power?",
+        s33, [
+            ("Find the cause on the POWER tab", lambda a: a.station is a.power),
+            ("Reset the tripped breaker (click once to OFF, again to ON)", lambda a: a.power.brk["VHF"].on and not a.power.brk["VHF"].tripped),
+            ("Prove the VHF: radio check on CH16 (PTT 3 s)", lambda a: "radio_check" in a.vuhf.flags),
+        ]))
+
+    def s34(app):
+        h_clean(app)
+        b = app.bench
+        b.b_r.on, b.b_s.on = False, True
+        b.tracer.on = False
+        b.inject("S", ["afa", "pdet", "afo", "ifl"][int(app.world.t * 1000) % 4])
+    D.append(Drill("Fault-finding 3: the audio tracer", "CIRCUITS",
+        "Use your ears: put the AUDIO TRACER on the probe and follow the signal until it stops.",
+        s34, [
+            ("Switch the AUDIO TRACER on", lambda a: a.bench.tracer.on),
+            ("Probe at least three stages", lambda a: a.bench.probes >= 3),
+            ("DECLARE the faulty block", lambda a: "diagnosed_S" in a.bench.flags),
+        ]))
     return D
 
 
@@ -362,8 +701,11 @@ class Training(Station):
         self.drills = build()
         self.sel, self.active, self.step, self.t0, self.done_t = 0, None, 0, 0.0, None
         self.btns = []
+        self.pitch = min(47.0, 768.0 / max(1, len(self.drills)))
         for i, d in enumerate(self.drills):
-            self.btns.append(self.add(Button((36, 84 + i * 47, 438, 40), d.title, d.brief, size=11)))
+            self.btns.append(self.add(Button((36, 82 + i * self.pitch, 438, int(self.pitch) - 3), d.title, d.brief,
+                                             size=11 if self.pitch > 30 else 9)))
+        self.mist0 = 0
         self.b_start = self.add(Button((1250, 84, 150, 44), "START DRILL", "Set up the scenario and start the clock.", color="green", size=13))
         self.b_stop = self.add(Button((1410, 84, 164, 44), "ABANDON DRILL", "Stop the current drill.", color="red", size=13))
         self.b_go = self.add(Button((516, 304, 240, 34), "GO TO STATION", "Jump to the station where this drill takes place."))
@@ -371,7 +713,17 @@ class Training(Station):
     def start(self, i):
         d = self.drills[i]
         self.active, self.step, self.t0, self.done_t = d, 0, self.world.t, None
+        _baseline(self.app)
         d.setup(self.app)
+        self.app.mistakes = []
+
+    def errors(self):
+        return [m for m in self.app.mistakes if m[0] >= self.t0] if self.active else []
+
+    def grade(self, secs, nerr):
+        if nerr == 0:
+            return "A" if secs < 90 * max(1, len(self.active.steps)) / 3.0 else "B"
+        return "B" if nerr == 1 else ("C" if nerr <= 3 else "D")
 
     def update(self, dt):
         for i, b in enumerate(self.btns):
@@ -401,18 +753,25 @@ class Training(Station):
             if self.step >= len(d.steps):
                 self.done_t = self.world.t - self.t0
                 ui.sfx("done")
+                self.result = (len(self.errors()), self.grade(self.done_t, len(self.errors())))
                 if d.best is None or self.done_t < d.best:
                     d.best = self.done_t
+                    d.grade = self.result[1]
 
     def draw_status(self, s, r):
         d = self.active
         if not d:
-            text(s, "No drill running - see the TRAINING tab (F7)", (r.x + 8, r.y + 9), 11, C["dim"], mono=False)
+            text(s, "No drill running - see the TRAINING tab (F11)", (r.x + 8, r.y + 9), 11, C["dim"], mono=False)
             return
         if self.done_t is not None:
-            text(s, "DRILL COMPLETE in %d s: %s" % (self.done_t, d.title), (r.x + 8, r.y + 9), 11, C["green"], bold=True, mono=False)
+            ne, g = getattr(self, "result", (0, "-"))
+            text(s, "DRILL COMPLETE in %d s, %d error%s, grade %s: %s" % (self.done_t, ne, "" if ne == 1 else "s", g, d.title),
+                 (r.x + 8, r.y + 9), 11, C["green"] if ne == 0 else C["amber"], bold=True, mono=False)
             return
-        text(s, "DRILL  step %d/%d   %d s" % (self.step + 1, len(d.steps), self.world.t - self.t0), (r.x + 8, r.y + 2), 10, C["amber"], bold=True)
+        ne = len(self.errors())
+        text(s, "DRILL  step %d/%d   %d s%s" % (self.step + 1, len(d.steps), self.world.t - self.t0,
+                                               "   ERRORS %d" % ne if ne else ""), (r.x + 8, r.y + 2), 10,
+             C["red"] if ne else C["amber"], bold=True)
         ui.text_block(s, d.steps[self.step][0], (r.x + 8, r.y + 15, r.w - 14, 18), 11, C["white"], mono=False, bold=True)
 
     def draw(self, s):
@@ -440,13 +799,23 @@ class Training(Station):
             text(s, st, (572, y + 11), 14, col, bold=cur, mono=False)
             y += 46
         y += 10
+        errs = self.errors() if run else []
         if run and self.done_t is not None:
-            text(s, "COMPLETE in %d seconds" % self.done_t, (530, y), 22, C["green"], bold=True, mono=False)
+            ne, g = getattr(self, "result", (0, "-"))
+            text(s, "COMPLETE in %d seconds  -  GRADE %s" % (self.done_t, g), (530, y), 22,
+                 C["green"] if ne == 0 else C["amber"], bold=True, mono=False)
         elif run:
             text(s, "RUNNING  %d s" % (self.world.t - self.t0), (530, y), 18, C["amber"], bold=True)
         else:
-            text(s, "Press START DRILL. The scenario is set up for you.", (530, y), 14, (90, 150, 110), mono=False)
+            text(s, "Press START DRILL. The scenario is set up for you: faults left over from free play are cleared.",
+                 (530, y), 14, (90, 150, 110), mono=False)
+        if errs:
+            y += 36
+            text(s, "OPERATING ERRORS (%d)" % len(errs), (530, y), 13, C["red"], bold=True)
+            for i, (tm, stn, msg) in enumerate(errs[-6:]):
+                ui.text_block(s, "%4d s  %s: %s" % (tm - self.t0, stn, msg), (530, y + 20 + i * 18, 1030, 18), 11,
+                              C["amber"], mono=False)
         super().draw(s)
         for i, dd in enumerate(self.drills):
             if dd.best is not None:
-                text(s, "OK %ds" % dd.best, (468, 88 + i * 47), 10, C["green"], bold=True, align="r")
+                text(s, "%s %ds" % (getattr(dd, "grade", "OK"), dd.best), (468, 84 + i * self.pitch), 9, C["green"], bold=True, align="r")

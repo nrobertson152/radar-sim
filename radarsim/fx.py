@@ -483,3 +483,118 @@ def radar_housing(w, h, cx, cy, R, y0):
         rgb += np.array([10, 34, 18.0])[None, None, :] * (np.clip(1 - o / 7.0, 0, 1) * (o > 0))[..., None]   # tube light on the inner wall
         _cache[k] = surf(rgb, np.where(o > 0, 255, 0))
     return _cache[k]
+
+
+# ------------------------------------------------- toggles and breakers
+def _hexr(ang, r):
+    """Radius of a hexagon (flats top and bottom) as a function of angle."""
+    return r / np.cos(((ang + np.pi / 6) % (np.pi / 3)) - np.pi / 6)
+
+
+def toggle(on, style="bat", tripped=False):
+    """Bat-handle toggle switch in a hex nut, or a moulded circuit breaker.
+    Seen from the operator's position: the lever stands out of the panel
+    towards you, so it is lit on its upper face and throws a shadow down and
+    to the right."""
+    k = ("toggle", bool(on), style, bool(tripped))
+    if k in _cache:
+        return _cache[k]
+    S = 3
+    w, h = 34, 52
+    W, H = w * S, h * S
+    x, y = grid(W, H)
+    cx, cy = (W - 1) / 2.0, (H - 1) / 2.0
+    dx, dy = (x - cx) / S, (y - cy) / S
+    if style == "breaker":
+        bw, bh = 13.0, 20.0
+        e = rrect_sd(dx + bw, dy + bh, 2 * bw, 2 * bh, 3.0)
+        body = e < 0
+        hgt = np.where(body, 4.0 * sstep(-e / 1.5), 0.0)
+        slot = (np.abs(dx) < 4.6) & (np.abs(dy) < 13.0)
+        hgt = np.where(slot, 1.0, hgt)
+        alb = np.where(body[..., None], np.array([30, 30, 33.0]), np.array([0, 0, 0.0]))
+        alb = np.where(slot[..., None], np.array([12, 12, 13.0]), alb)
+        pos = 0.0 if tripped else (-7.5 if on else 7.5)
+        lev = (np.abs(dx) < 4.0) & (np.abs(dy - pos) < 5.0)
+        prof = np.sqrt(np.clip(1 - (dx / 4.0) ** 2, 0, 1))
+        hgt = np.where(lev, 6.0 + 4.0 * prof - 1.5 * ((dy - pos) / 5.0) * (1 if on else -1), hgt)
+        alb = np.where(lev[..., None], np.array([235, 233, 222.0]) if not tripped else np.array([240, 140, 40.0]), alb)
+        if tripped:
+            flag = slot & ~lev & (np.abs(dy) < 9)
+            alb = np.where(flag[..., None], np.array([230, 110, 20.0]), alb)
+        rgb = shade(hgt * S, alb, spec=0.55, gloss=20, amb=0.4)
+        sh = rrect_sd(dx + bw - 2.5, dy + bh - 3.5, 2 * bw, 2 * bh, 3.0) < 0
+        al = np.where(body, 255, np.where(sh, 120, 0))
+        rgb = np.where(body[..., None], rgb, 0)
+    else:
+        ang = np.arctan2(dy, dx)
+        rr = np.hypot(dx, dy)
+        hr = _hexr(ang, 9.0)
+        nut = rr < hr
+        hgt = np.where(nut, 2.6 * sstep((hr - rr) / 1.1), 0.0)
+        bush = rr < 5.3
+        thread = 0.25 * np.sin(rr * 9.0)
+        hgt = np.where(bush, 2.6 + 2.0 * sstep((5.3 - rr) / 0.9) + thread, hgt)
+        alb = np.where(nut[..., None], np.array([150, 152, 157.0]), np.array([0, 0, 0.0]))
+        sgn = -1.0 if on else 1.0
+        L = 15.0
+        if tripped:
+            L = 3.0
+        along = dy * sgn
+        tpar = np.clip(along / L, 0, 1)
+        rad = 2.4 - 0.5 * tpar
+        shaft = (along > -1.5) & (along < L) & (np.abs(dx) < rad)
+        tip = (dx / 3.2) ** 2 + ((along - L) / 4.3) ** 2 < 1.0
+        lever = shaft | tip
+        lh = 6.0 + 9.0 * tpar + 1.6 * np.sqrt(np.clip(1 - (dx / np.where(tip, 3.2, rad)) ** 2, 0, 1))
+        hgt = np.where(lever, np.maximum(hgt, lh), hgt)
+        alb = np.where(lever[..., None], np.array([212, 214, 220.0]), alb)
+        rgb = shade(hgt * S, alb, spec=0.95, gloss=34, amb=0.33)
+        # cast shadow of the lever, down and to the right
+        sa = (dy - 4.5) * sgn
+        sp = np.clip(sa / L, 0, 1)
+        shl = (((sa > -1.5) & (sa < L) & (np.abs(dx - 3.0) < 2.6)) |
+               ((((dx - 3.0) / 3.4) ** 2 + ((sa - L) / 4.5) ** 2) < 1.0))
+        shadow = shl & ~nut & ~lever
+        nsh = (rr > hr) & (np.hypot(dx - 2.0, dy - 2.5) < _hexr(np.arctan2(dy - 2.5, dx - 2.0), 9.0))
+        al = np.where(nut | lever, 255, np.where(shadow, 130 * (1 - 0.4 * sp), np.where(nsh, 90, 0)))
+        rgb = np.where((nut | lever)[..., None], rgb, 0)
+    out = _fast(down(surf(rgb, al), S), True)
+    _cache[k] = out
+    return out
+
+
+def thumbwheel(w, h):
+    """Housing and drum of a thumbwheel switch (the digit is drawn live)."""
+    k = ("thumb", w, h)
+    if k not in _cache:
+        S = 3
+        W, H = w * S, h * S
+        x, y = grid(W, H)
+        e = -rrect_sd(x, y, W, H, 3 * S)
+        win = (np.abs(x - W / 2.0) < W * 0.36) & (np.abs(y - H / 2.0) < H * 0.27)
+        hgt = np.minimum(e, 2.0 * S) * 0.9
+        v = (y - H / 2.0) / (H * 0.27)
+        drum = np.sqrt(np.clip(1 - v * v, 0, 1))
+        hgt = np.where(win, -1.5 * S + 2.5 * S * drum, hgt)
+        rib = (~win) & (np.abs(x - W / 2.0) < W * 0.32) & ((np.abs(y - H * 0.11) < H * 0.05) | (np.abs(y - H * 0.89) < H * 0.05))
+        hgt = np.where(rib, hgt + 1.4 * S, hgt)
+        alb = np.where(win[..., None], (np.array([18, 18, 20.0]) + 40 * drum[..., None]), np.array([36, 37, 40.0]))
+        alb = np.where(rib[..., None], np.array([70, 72, 76.0]), alb)
+        rgb = shade(hgt, alb, spec=0.5, gloss=18, amb=0.42)
+        _cache[k] = _fast(down(surf(rgb, 255 * sstep((e + 0.5) / 1.0)), S), True)
+    return _cache[k]
+
+
+def paper(w, h):
+    """A strip of thermal / dot-matrix printer paper coming out of a slot."""
+    k = ("paper", w, h)
+    if k not in _cache:
+        x, y = grid(w, h)
+        base = np.array([226, 222, 204.0])[None, None, :] * (0.96 + 0.04 * noise(w, h, 7))[..., None]
+        base = base * (0.93 + 0.07 * sstep(np.minimum(x, w - 1 - x) / 10.0))[..., None]
+        hole = ((x % 1 == 0) & False)
+        rgb = shade(noise(w, h, 2) * 0.6, base, spec=0.05, gloss=6, amb=0.85)
+        rgb[hole] = 40
+        _cache[k] = _fast(surf(rgb))
+    return _cache[k]

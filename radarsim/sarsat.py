@@ -9,7 +9,7 @@ with the classic two-sided ambiguity until a second pass.
 import math
 import pygame
 from . import ui
-from .ui import C, text, Selector, Button, Station
+from .ui import C, text, Selector, Button, Toggle, Station
 from .world import LEOSAR, RE, gc_dist, gc_bearing, gc_dest, fmt_lat, fmt_lon
 from .worldmap import WorldMap
 
@@ -26,8 +26,10 @@ def ecef(lat, lon, r):
 
 class Sarsat(Station):
     name = "COSPAS-SARSAT"
+    tab = "SARSAT"
     hint = ("Set the EPIRB to ON (or ARMED then IMMERSE) and raise SIM TIME to watch satellites pick "
             "up the bursts. Compare a beacon with and without GNSS, and with MEOSAR on and off.")
+    pan, bg_pan = 0.0, 0.75
 
     def __init__(self, app):
         super().__init__(app)
@@ -55,6 +57,17 @@ class Sarsat(Station):
             "Speed of the satellite clock. A LEOSAR pass lasts up to 15 minutes and the wait for one "
             "can exceed an hour - speed it up."))
         self.b_rst = self.add(Button((1404, 214, 170, 34), "RESET SCENARIO", "Switch the beacon off and clear the alert chain."))
+        ti = "BEACON CARE (INSTRUCTOR): "
+        self.reg = self.add(Toggle(990, 800, "REGISTERED", True, ti + "the beacon's 15-hex ID is registered with the "
+            "owner's details. Unregistered: the MCC cannot tell who you are or who to call - the alert chain is much slower."))
+        self.hru = self.add(Toggle(1090, 800, "HRU\nEXPIRED", False, ti + "the hydrostatic release unit is past its "
+            "expiry date and seizes: the beacon does NOT float free when the ship sinks."))
+        self.batt = self.add(Toggle(1190, 800, "BATTERY\nEXPIRED", False, ti + "battery past its expiry: the beacon "
+            "transmits a few bursts and dies."))
+        self.homer = self.add(Toggle(1290, 800, "121.5\nHOMER", True, ti + "the 121.5 MHz homing transmitter used "
+            "by SAR aircraft for the final approach (heard on the air radio guard receiver)."))
+        self.btype = self.add(Selector(1400, 806, 22, "TYPE", ["EPIRB", "PLB"], 0, ti + "EPIRB: float-free, 48 h "
+            "battery, registered to the ship. PLB: personal beacon, manual only (cannot float free), 24 h battery."))
 
     def reset(self):
         self.active, self.t0, self.next_burst, self.nburst = False, None, None, 0
@@ -91,6 +104,7 @@ class Sarsat(Station):
         if self.active:
             return
         w = self.world
+        w.epirb_homer = self.homer.on
         self.active, self.t0, self.next_burst = True, self.st, self.st + 50.0
         self.blat, self.blon = w.lat, w.lon
         w.epirb_on = True
@@ -99,6 +113,12 @@ class Sarsat(Station):
         self.ev("BEACON ACTIVATED (%s) - 121.5 MHz homer on, strobe on" % how, C["red"])
 
     def _burst(self, t):
+        if self.batt.on and self.nburst >= 3:
+            if self.next_burst is not None:
+                self.ev("BEACON BATTERY EXHAUSTED - TRANSMISSIONS STOPPED (battery past its expiry date)", C["red"], t)
+                self.next_burst = None
+                self.world.epirb_on = False
+            return
         self.nburst += 1
         if self.app.station is self:
             ui.sfx("burst406", 0.6)
@@ -164,7 +184,14 @@ class Sarsat(Station):
             self.reset()
             self.sw.set(0)
         if self.b_imm.pop():
-            if self.sw.value == "ARMED":
+            if self.btype.value == "PLB":
+                self.ev("A PLB cannot float free - it must be carried and switched on by hand.", C["amber"])
+            elif self.hru.on:
+                self.flags["hru_fail"] = w.t
+                self.ev("HYDROSTATIC RELEASE FAILED (expired HRU) - THE BEACON WENT DOWN WITH THE SHIP. Check the "
+                        "HRU expiry date on every inspection.", C["red"])
+                self.mistake("EPIRB hydrostatic release past its expiry date - the beacon did not float free.")
+            elif self.sw.value == "ARMED":
                 self.activate("hydrostatic release")
             else:
                 self.ev("Beacon immersed but switch is %s - it will NOT activate. Keep it ARMED at sea." % self.sw.value, C["amber"])
@@ -186,11 +213,21 @@ class Sarsat(Station):
         w.own_sart = srt == "ON"
         if srt == "ON":
             self.flags["sart_on"] = w.t
+        if srt == "TEST" and getattr(self, "_srt", "") != "TEST":
+            self.flags["sart_test"] = w.t
+            ui.sfx("sart", 0.8)
+            self.ev("SART SELF-TEST: buzzer and lamp OK. Check its rings on your own X-band radar.", C["cyan"])
+        self._srt = srt
+        if self.active and self.app.station is self and int(w.t / 3.0) != getattr(self, "_strobe", -1):
+            self._strobe = int(w.t / 3.0)
+            ui.sfx("tick", 0.7, pan=0.2)
         self.st += dt * WARPS[self.warp.idx]
         if self.active:
             n = 0
             while self.next_burst is not None and self.st >= self.next_burst and n < 20:
                 self._burst(self.next_burst)
+                if self.next_burst is None:
+                    break
                 self.next_burst += 50.0
                 n += 1
             for name, p in list(self.passes.items()):
@@ -198,8 +235,14 @@ class Sarsat(Station):
                     del self.passes[name]
                     self._end_pass(p, self.st)
             if self.t_mcc and self.st >= self.t_mcc and self.t_rcc is None:
-                self.t_rcc = self.t_mcc + 180
-                self.ev("LUT -> MISSION CONTROL CENTRE: alert validated against the beacon registration database", C["text"], self.t_mcc)
+                if self.reg.on:
+                    self.t_rcc = self.t_mcc + 180
+                    self.ev("LUT -> MISSION CONTROL CENTRE: alert validated against the beacon registration database", C["text"], self.t_mcc)
+                else:
+                    self.t_rcc = self.t_mcc + 2400
+                    self.flags["unregistered"] = w.t
+                    self.ev("MCC: BEACON NOT REGISTERED - no vessel or owner details. Confirmation needs a second "
+                            "detection; SAR action delayed", C["amber"], self.t_mcc)
             if self.t_rcc and self.st >= self.t_rcc and self.t_sar is None:
                 self.t_sar = self.t_rcc + 600
                 self.ev("MCC -> RESCUE CO-ORDINATION CENTRE (MRCC PENHALE): owner contacted, broadcast to shipping", C["text"], self.t_rcc)
@@ -207,9 +250,8 @@ class Sarsat(Station):
                 self.flags["sar"] = w.t
                 self.ev("SAR UNITS TASKED: helicopter RESCUE 193 and lifeboat proceeding. They home on 121.5 MHz and your SART.", C["green"], self.t_sar)
                 heli = w.by_name["RESCUE 193"]
-                if not heli.active:
-                    heli.active = True
-                    heli.x, heli.y, heli.cog, heli.sog = w.x + 9, w.y + 13, 215, 110
+                if not heli.home:
+                    w.task_sar(heli, 16.0, 35.0)
 
     def tip_at(self, pos):
         t = super().tip_at(pos)
@@ -221,7 +263,7 @@ class Sarsat(Station):
         if pygame.Rect(20, 532, 900, 328).collidepoint(pos):
             return ("DOPPLER CURVE: received frequency minus 406.028 MHz at each burst. Approaching = high, receding = low. "
                     "The zero crossing is the time of closest approach; a steep curve means the track passed nearly overhead.")
-        if pygame.Rect(930, 470, 660, 390).collidepoint(pos):
+        if pygame.Rect(930, 470, 660, 250).collidepoint(pos):
             return "ALERT CHAIN: beacon -> satellite -> Local User Terminal (LUT) -> Mission Control Centre (MCC) -> Rescue Co-ordination Centre (RCC) -> SAR units."
         return ""
 
@@ -232,7 +274,8 @@ class Sarsat(Station):
         ui.panel(s, (20, 532, 900, 328), "LEOSAR DOPPLER MEASUREMENTS  (406.028 MHz)")
         ui.panel(s, (930, 54, 660, 204), "406 MHz EPIRB  -  FLOAT-FREE, CATEGORY 1")
         ui.panel(s, (930, 266, 660, 196), "9 GHz RADAR SART   |   SIMULATION")
-        ui.panel(s, (930, 470, 660, 390), "ALERT CHAIN TIMELINE")
+        ui.panel(s, (930, 470, 660, 250), "ALERT CHAIN TIMELINE")
+        ui.panel(s, (930, 728, 660, 132), "BEACON CARE  -  INSTRUCTOR")
         ui.crt(s, self.map.rect, gain=80)
         self.map.draw(s)
         blat, blon = (self.blat, self.blon) if self.active else (w.lat, w.lon)
@@ -265,7 +308,9 @@ class Sarsat(Station):
                 "406.028 MHz 5 W digital burst / 121.5 MHz 50 mW homer",
                 "NEXT BURST %s    BURSTS SENT %d" % (("%2d s" % max(0, self.next_burst - self.st)) if self.active else "--", self.nburst),
                 "POS IN MESSAGE: %s" % ((fmt_lat(blat) + " " + fmt_lon(blon)) if self.b_gnss.on else "NONE (no GNSS)"),
-                "BATTERY 48 h min @ -20C   EXPIRY 08/2030   HRU 03/2028"]
+                "BATTERY %s   HRU %s   %s" % ("EXPIRED 01/2024" if self.batt.on else "48 h, EXP 08/2030",
+                                               "EXPIRED 03/2025" if self.hru.on else "EXP 03/2028",
+                                               "REGISTERED" if self.reg.on else "NOT REGISTERED")]
         for i, r in enumerate(rows):
             text(s, r, (l.x + 10, l.y + 6 + i * 19), 12, C["red"] if (i == 1 and self.active) else fg, bold=i == 1)
         strobe = (self.active and (w.t % 3) < 0.12) or (w.t < self.test_until and int(w.t * 4) % 2 == 0)
@@ -296,12 +341,12 @@ class Sarsat(Station):
                              "it and keep the owner details current.\n \nTry: 1) GNSS ENCODED on, switch ON - located in "
                              "about a minute by GEOSAR.  2) RESET, GNSS off, MEOSAR off - you must wait for a LEOSAR "
                              "pass, then a second one to resolve the A/B ambiguity.  3) MEOSAR on.",
-                          (946, y, 628, 300), 12, C["dim"], mono=False, lh=18)
-        for tm, msg, col in self.events[-13:]:
+                          (946, y, 628, 250), 12, C["dim"], mono=False, lh=18)
+        for tm, msg, col in self.events[-8:]:
             el = tm - (self.t0 if self.t0 is not None else tm)
             text(s, "T+" + self._hms(max(0, el)), (946, y), 12, C["dim"], bold=True)
             y = ui.text_block(s, msg, (1040, y, 536, 60), 12, col, lh=15, mono=False) + 5
-            if y > 838:
+            if y > 700:
                 break
         if self.t_loc is not None and "sar" not in self.flags:
             nxt = self.t_sar or self.t_rcc or self.t_mcc

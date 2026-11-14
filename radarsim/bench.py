@@ -9,6 +9,7 @@ import pygame
 from . import ui, fx
 from .ui import C, text, Selector, Button, Station
 from .radar import PULSES
+from .audio import speaker
 
 BW, BH = 130, 56
 N = 438
@@ -125,6 +126,14 @@ class Bench(Station):
         self.b_inj = self.add(Button((40, 650, 200, 40), "INJECT RANDOM FAULT", "Instructor: break one stage of the equipment shown. The RADAR / MF-HF station is affected too.", color="red"))
         self.b_dec = self.add(Button((40, 698, 200, 40), "DECLARE SELECTED\nBLOCK FAULTY", "Commit to your diagnosis: the selected block is the faulty stage.", color="green", size=10))
         self.b_fix = self.add(Button((40, 746, 200, 40), "REPAIR ALL / GIVE UP", "Clear every fault (reveals the answer)."))
+        self.b_hint = self.add(Button((40, 794, 200, 40), "HINT  (-15 POINTS)", "Narrow the search: tells you which "
+            "part of the equipment the fault is in. Costs 15 points, once per fault.", size=10))
+        self.tracer = self.add(Button((1456, 70, 118, 26), "AUDIO TRACER", "SIGNAL TRACER: an audio probe on the "
+            "same test point as the scope. Listen: tone or voice in the audio stages, the PRF buzz in the radar "
+            "transmitter, receiver hiss in the IF, a steady beat from an oscillator - and silence from a dead stage.",
+            toggle=True, size=9))
+        self.tspk = speaker("tracer")
+        self.hinted = {"R": False, "S": False}
 
     @property
     def which(self):
@@ -311,6 +320,17 @@ class Bench(Station):
             f = ids[int(self.rng.integers(len(ids)))]
             self.inject(k, f)
             ui.sfx("fault")
+        if self.b_hint.pop():
+            f = self.fault[k]
+            if not f:
+                self.result = "No fault injected - nothing to hint at."
+            elif self.hinted[k]:
+                self.result = self._hint(k, f) + "  (already used)"
+            else:
+                self.hinted[k] = True
+                self.score -= 15
+                self.result = self._hint(k, f)
+                ui.sfx("page", 0.6)
         if self.b_fix.pop():
             ui.sfx("ok")
             f = self.fault[k]
@@ -334,12 +354,72 @@ class Bench(Station):
                 self.result = "WRONG (-20). %s %s Find the FIRST stage whose inputs are good but whose output is dead." % (
                     self.label(k, self.sel[k]), "is producing a normal output." if ok else "has no output, but is its INPUT present? A stage with no input is not faulty.")
 
+    def _hint(self, k, f):
+        if k == "R":
+            if f in ("trig", "mod", "mag", "dup", "ant"):
+                return "HINT: the fault is in the TRANSMITTER chain (trigger to scanner)."
+            if f in ("lo", "afc", "stc"):
+                return "HINT: the fault is in a SIDE INPUT to the receiver (local oscillator, AFC or STC)."
+            if f in ("psu", "dsp"):
+                return "HINT: the fault is in the power supply or the display end."
+            return "HINT: the fault is in the RECEIVER chain (TR limiter to video amplifier)."
+        if f in ("mic", "afa", "bal", "sbf", "txm", "drv", "pa"):
+            return "HINT: the fault is in the TRANSMIT chain."
+        if f in ("cosc", "synth"):
+            return "HINT: the fault is in an OSCILLATOR shared by transmit and receive."
+        return "HINT: the fault is in the RECEIVE chain (tuner to loudspeaker)."
+
+    def audio(self, syn, n):
+        """The signal tracer: what the probed test point sounds like."""
+        if not self.tracer.on:
+            return None
+        k = self.which
+        bid = self.sel[k]
+        alive = self.alive_radar(self.world.rh) if k == "R" else self.alive_ssb(self.world.hh)
+        hum = syn.osc("trhum", 100.0, n) * 0.004
+        if not alive.get(bid):
+            return self.tspk(hum + syn.noise(n) * 0.004)
+        if k == "S":
+            idx = self.sig.idx
+            if idx == 0:
+                aud = syn.osc("tr1", 1000.0, n) * 0.35
+            elif idx == 1:
+                aud = (syn.osc("tr2a", 700.0, n) + syn.osc("tr2b", 1900.0, n)) * 0.2
+            else:
+                aud = syn.voice("trv", n) * 1.2
+            if bid in ("cosc", "synth"):
+                x = syn.osc("trosc", 1200.0 if bid == "cosc" else 1650.0, n) * 0.16
+            elif bid == "mic":
+                x = aud * 0.35 + syn.noise(n) * 0.02
+            elif bid in ("afa", "pdet", "afo", "spk"):
+                x = aud
+            elif bid in ("rxm", "ifl"):
+                x = aud * 0.6 + syn.noise(n) * 0.25
+            elif bid == "atu":
+                x = aud * 0.7 if alive.get("key") else (syn.noise(n) * 0.3 + aud * 0.2)
+            else:
+                x = aud * 0.8 + syn.noise(n) * 0.03
+        else:
+            prf = PULSES[self.app.radar.pulse.value][1]
+            if bid in ("trig", "mod", "mag", "dup", "ant", "stc", "dsp"):
+                x = syn.whine("trprf", prf, n) * 0.25
+            elif bid == "psu":
+                x = syn.osc("trpsu", 100.0, n) * 0.08 + syn.osc("trpsu2", 200.0, n) * 0.03
+            elif bid == "lo":
+                x = syn.osc("trlo", 1000.0, n) * 0.15
+            elif bid == "afc":
+                x = syn.osc("trafc", 50.0, n) * 0.02
+            else:
+                x = syn.noise(n) * 0.25 + syn.whine("trprf2", prf, n) * (0.2 if alive.get("mag") else 0.0)
+        return self.tspk(x + hum)
+
     def label(self, k, bid):
         return next(b[1] for b in (RADAR_BLK if k == "R" else SSB_BLK) if b[0] == bid)
 
     def inject(self, k, f):
         (self.world.rh if k == "R" else self.world.hh)[f] = False
         self.fault[k] = f
+        self.hinted[k] = False
         self.probes = 0
         self.flags.pop("diagnosed_" + k, None)
         self.result = ""
