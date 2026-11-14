@@ -15,7 +15,8 @@ from .ui import C, text, Knob, Selector, Button, Guard, Station
 from .world import HF_STATIONS, HF_DSC, HF_RT, ITU_BANDS, itu_channel, s_units, s_text, CPS, fmt_lat, fmt_lon
 from .radiocore import Monitor, garble
 from .speech import SR, chunk
-from .world import Msg
+from .world import Msg, cos_zenith
+from .audio import speaker
 
 MODES = ["USB", "LSB", "AM", "CW", "FSK"]
 EMISSION = {"USB": "J3E", "LSB": "J3E", "AM": "H3E", "CW": "A1A", "FSK": "F1B"}
@@ -27,8 +28,11 @@ PRED = ["NORTHSEA RADIO", "AEGEAN RADIO", "ATLANTIC WX", "WWV TIME SIGNAL", "PEN
 
 class HF(Station):
     name = "MF / HF SSB"
+    tab = "MF/HF"
     hint = ("Type a frequency on the keypad then kHz (or an ITU channel then CH). Turn the big knob "
             "or click the waterfall to tune. TUNE the antenna before transmitting. SPACE = PTT.")
+    power_key = "MFHF"
+    pan, bg_pan, bg_listen, bg_level = 0.1, 0.4, True, 0.22
 
     def __init__(self, app):
         super().__init__(app)
@@ -57,10 +61,26 @@ class HF(Station):
         self.wsurf.set_palette(pal)
         self._wt = 0.0
         self.pred_i, self._pred, self._pt = 0, None, -9
+        self.spk = speaker("hf")
+        self.crash_q, self.crash_t, self.crash_db = [], -9.0, 0.0
+        self._qrn_tail = np.zeros(0)
+        self._agc_g = 0.1
+        self.fan, self.pa_temp = 0.0, 32.0
+        self.burst_until = 0.0
+        self._mains = True
 
-        self.meter_sel = self.add(Selector(706, 136, 22, "METER", ["S", "PO", "SWR", "IC"], 0,
+        self.meter_sel = self.add(Selector(706, 136, 22, "METER", ["S", "PO", "SWR", "IC", "TEMP"], 0,
             "METER: S = received signal strength (S9 = -73 dBm = 50 uV, 6 dB per S-unit); PO = "
-            "forward power; SWR = standing wave ratio at the tuner; IC = PA collector current."))
+            "forward power; SWR = standing wave ratio at the tuner; IC = PA collector current; TEMP = PA heatsink."))
+        self.agc_b = self.add(Button((736, 190, 80, 32), "AGC\nSLOW", "AGC (automatic gain control): FAST for CW "
+            "and data, SLOW for SSB voice. A strong station turns the gain down, so the background hiss drops. OFF: "
+            "fixed gain set by RF GAIN - strong signals overload and distort unless you turn RF GAIN down.", size=9))
+        self.nb_b = self.add(Button((822, 190, 52, 32), "NB", "NOISE BLANKER: cuts the impulsive crashes of "
+            "atmospheric static (and ignition noise) before they reach the AGC. Without it each crash garbles "
+            "copy and makes the AGC pump.", toggle=True, size=11))
+        self.pwr_b = self.add(Button((880, 190, 52, 32), "PWR", "Transceiver power.", toggle=True, on=True,
+                                     color="green", size=10))
+        self.agc = "SLOW"
         self.mode = self.add(Selector(790, 136, 22, "MODE", MODES, 0,
             "MODE / emission class: USB J3E (marine R/T standard), LSB, AM H3E, CW A1A (Morse), "
             "FSK F1B (NAVTEX, telex, DSC). All marine HF voice is UPPER sideband."))
@@ -157,12 +177,15 @@ class HF(Station):
             ch = ev.unicode
             if ch and ch in "0123456789.":
                 self._key(ch)
+                ui.sfx("key", 0.6, pan=0.25)
                 return True
             if ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 self._key("kHz")
+                ui.sfx("key", 0.6, pan=0.25)
                 return True
             if ev.key == pygame.K_BACKSPACE:
                 self._key("BS")
+                ui.sfx("key", 0.5, pan=0.25)
                 return True
             if ev.key in (pygame.K_UP, pygame.K_RIGHT):
                 self._turn(1)
@@ -178,6 +201,7 @@ class HF(Station):
         if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1 and pygame.Rect(36, 420, 896, 406).collidepoint(ev.pos):
             off = (ev.pos[0] - 36) / 896.0 * SPAN - SPAN / 2
             self.set_freq(round((self.f + off) * 10) / 10.0, self.split, self.chan)
+            ui.sfx("detent", 0.7)
             return True
         return False
 
@@ -223,9 +247,23 @@ class HF(Station):
         self.temp = [t for t in self.temp if w.t < t["t0"] + t.get("_len", 30.0)]
         return HF_STATIONS + self.temp
 
+    @property
+    def on(self):
+        return self.pwr_b.on and self.powered
+
+    def qsb(self, st, p):
+        """Sky-wave fading (dB, <= 0): slow deep fades with occasional nulls."""
+        if p["mode"] == "GROUND" and st["f"] < 3000:
+            return 0.0
+        t = self.world.t
+        ph = (hash(st["key"]) % 1000) / 159.0
+        u = 0.5 + 0.5 * (0.6 * math.sin(2 * math.pi * t / (8.0 + ph % 5) + ph)
+                         + 0.4 * math.sin(2 * math.pi * t / (3.3 + ph % 2) + 2 * ph))
+        return -(7.0 + 2.0 * min(3, p["hops"])) * 1.6 * (1 - u) ** 2
+
     def rx_ok(self, audio=True):
         h = self.world.hh
-        ok = h["atu"] and h["rxm"] and h["synth"] and h["ifl"]
+        ok = self.on and h["atu"] and h["rxm"] and h["synth"] and h["ifl"]
         return ok and (not audio or (h["cosc"] and h["pdet"] and h["afo"] and h["spk"]))
 
     def update(self, dt):
@@ -234,6 +272,29 @@ class HF(Station):
             if w.t >= item[0]:
                 self.pending.remove(item)
                 item[1]()
+        if self.pwr_b.pop():
+            ui.sfx("pwron" if self.pwr_b.on else "pwroff", 0.8)
+        if self.powered != self._mains:
+            self._mains = self.powered
+            if self.pwr_b.on:
+                ui.sfx("pwron" if self._mains else "pwroff", 0.7, pan=self.bg_pan)
+        if self.agc_b.pop():
+            self.agc = {"SLOW": "FAST", "FAST": "OFF", "OFF": "SLOW"}[self.agc]
+        self.agc_b.label = "AGC\n" + self.agc
+        # atmospheric static crashes (QRN): more on the low bands and at night
+        fm = max(1.6, self.f / 1000.0)
+        night = cos_zenith(w.lat, w.lon, w.utc_h, w.doy) <= 0
+        rate = 3.0 * (2.0 / fm) ** 1.3 * (1.6 if night else 0.55)
+        if self.on:
+            for _ in range(int(self.rng.poisson(rate * dt))):
+                amp = float(np.exp(self.rng.normal(2.6, 0.8)))
+                tau = float(self.rng.uniform(0.004, 0.03))
+                self.crash_q.append((amp, tau))
+                db = 20 * math.log10(amp) - (18.0 if self.nb_b.on else 0.0)
+                if w.t - self.crash_t > 0.15 or db > self.crash_db:
+                    self.crash_db = db
+                self.crash_t = w.t
+            del self.crash_q[:-12]
         for k, b in self.keys.items():
             if b.pop():
                 self._key(k)
@@ -269,7 +330,7 @@ class HF(Station):
         if self.guard.pop_fired():
             self.send_distress()
         # transmit
-        tx = (self.ptt.down or (self.key_ptt and self.app.station is self)) and not self.tuning_until
+        tx = (self.ptt.down or (self.key_ptt and self.app.station is self)) and not self.tuning_until and self.on
         if tx != self.tx:
             ui.sfx("relay", 1.0)
         if self.tuning_until and w.t - getattr(self, "_rl", 0) > 0.13:      # tuner relays hunting for a match
@@ -287,7 +348,9 @@ class HF(Station):
             k = 1 - (self.tuning_until - w.t) / 2.2
             self.swr = max(1.15, 6.0 * (1 - k) ** 2 + 1.15 + 0.6 * abs(math.sin(k * 20)) * (1 - k))
         pmax = [60.0, 150.0, 400.0][self.pwr.idx]
-        chain = all(h[k] for k in ("mic", "afa", "bal", "cosc", "sbf", "synth", "txm", "drv", "pa"))
+        if self.pa_temp > 85:
+            pmax *= 0.25                                # PA thermal fold-back
+        chain = self.on and all(h[k] for k in ("mic", "afa", "bal", "cosc", "sbf", "synth", "txm", "drv", "pa"))
         if self.tuning_until:
             self.po = 15.0 if chain else 0.0
         elif tx and chain:
@@ -296,6 +359,18 @@ class HF(Station):
             self.po = pmax * env * (0.12 if self.swr > 3 else 1.0)
         else:
             self.po = 0.0
+        # PA heatsink and its cooling fan
+        heat = self.po / 400.0 * (1.0 + 0.6 * max(0.0, self.swr - 1.5))
+        self.pa_temp += (heat * 1.6 - (self.pa_temp - 32.0) * (0.02 + 0.05 * self.fan)) * dt
+        fan_t = 1.0 if (self.po > 80 or self.pa_temp > 55) else 0.0
+        self.fan += max(-0.08 * dt, min(0.6 * dt, fan_t - self.fan))
+        if self.pa_temp > 85 and not getattr(self, "_hot", False):
+            self._hot = True
+            ui.sfx("error", 0.5)
+            self.mon.note(w.utc_str(), "[PA OVER-TEMPERATURE - POWER FOLDED BACK. Shorter overs, lower power, check SWR.]", C["red"])
+            self.mistake("MF/HF power amplifier overheated (long transmissions / high SWR).")
+        elif self.pa_temp < 70:
+            self._hot = False
         # receive
         frx = self.f + self.rit.val / 1000.0
         self.sigs = []
@@ -304,7 +379,11 @@ class HF(Station):
             if "t0" not in st and st["f"] in answering:
                 continue
             if abs(st["f"] - self.f) < SPAN / 2 + 3 and w.hf_on(st):
-                self.sigs.append((st, w.hf_rx(st)))
+                p = w.hf_rx(st)
+                fd = self.qsb(st, p)
+                if fd:
+                    p = dict(p, pr=p["pr"] + fd, snr=p["snr"] + fd)
+                self.sigs.append((st, p))
         self.noise = w.hf_noise(self.f)
         att = (20 if self.b_att.on else 0) + (1 - self.rf.val) * 40
         tot = 10 ** (self.noise / 10)
@@ -370,10 +449,15 @@ class HF(Station):
             last = i - 1
         st["_ci"] = i
         hdr = "%s  %s  %g kHz  %s  SNR %d dB  via %s" % (w.utc_str(), st["name"], st["f"], s_text(p["pr"]), p["snr"], p["mode"])
+        q = dm["q"]
+        if w.t - self.crash_t < 0.2 and self.crash_db > p["snr"] - 3:
+            q *= 0.2                                     # a static crash wiped out what was being said
         for j in range(last + 1, i + 1):
-            ch = garble(txt[j % len(txt)], dm["q"], j)
-            self.mon.feed(st["key"] + self.mode.value, hdr, ch, C["lcdfg"] if dm["q"] > 0.6 else C["amber"])
-            if dm["q"] > 0.85 and ch != " ":
+            ch = garble(txt[j % len(txt)], q, j)
+            if st["kind"] == "navtex" and (self.app.station is self or self.app.monitor_all):
+                ui.sfx("dot", 0.22 if self.app.station is self else 0.08, pan=0.3)
+            self.mon.feed(st["key"] + self.mode.value, hdr, ch, C["lcdfg"] if q > 0.6 else C["amber"])
+            if q > 0.85 and ch != " ":
                 self.flags["copy:" + st["name"]] = self.flags.get("copy:" + st["name"], 0) + 1
 
     def _dsc_watch(self):
@@ -472,7 +556,7 @@ class HF(Station):
         w, rng = self.world, self.rng
         fa = self.f + (np.arange(NB) - NB / 2 + 0.5) * SPAN / NB
         line = self.noise - 15 + rng.normal(0, 2.2, NB)
-        if self.world.hh["rxm"] and self.world.hh["synth"] and self.world.hh["atu"]:
+        if self.on and self.world.hh["rxm"] and self.world.hh["synth"] and self.world.hh["atu"]:
             for st, p in self.sigs:
                 fc, pr, k = st["f"], p["pr"], st["kind"]
                 if k in ("voice", "fax"):
@@ -493,6 +577,8 @@ class HF(Station):
                     for off in (-0.085, 0.085):
                         if rng.random() < 0.7:
                             line[np.argmin(np.abs(fa - fc - off))] = pr - 2
+            if w.t - self.crash_t < 0.09:
+                line = np.maximum(line, self.noise - 15 + self.crash_db - 6 + rng.normal(0, 3, NB))
             if self.tx or self.tuning_until:
                 mk = (fa > self.txf + (0 if self.tuning_until else 0.3)) & (fa < self.txf + (0.06 if self.tuning_until else 2.7))
                 line[mk] = -30 - rng.uniform(0, 12, int(mk.sum()))
@@ -505,9 +591,29 @@ class HF(Station):
 
     # ----------------------------------------------------------------- audio
     def bg_audio(self, syn, n):
+        out = None
         if self.world.t < getattr(self, "burst_until", 0):
-            return syn.fsk("hfdsc", n, 100, 1700.0, 170.0) * 0.5
-        return None
+            out = syn.fsk("hfdsc", n, 100, 1700.0, 170.0) * 0.5
+        if self.fan > 0.01:
+            k = 1.0 if self.app.station is self else 0.4
+            f = (syn.rumble("hffan", n, 3) * 0.035 + syn.osc("hffb", 220 + 110 * self.fan, n) * 0.006) * self.fan * k
+            out = f if out is None else out + f
+        return out
+
+    def _qrn(self, syn, n):
+        """Static crashes queued by update(), in receiver noise units."""
+        buf = np.zeros(n + 4096)
+        m = min(len(self._qrn_tail), len(buf))
+        buf[:m] += self._qrn_tail[:m]
+        for amp, tau in self.crash_q:
+            L = int(tau * SR * 6)
+            i0 = int(self.rng.integers(0, n))
+            k = np.arange(L)
+            b = syn.white(L) * 3.0 * amp * np.exp(-k / (tau * SR)) * (0.1 if self.nb_b.on else 1.0)
+            buf[i0:i0 + L] += b[:len(buf) - i0]
+        self.crash_q = []
+        self._qrn_tail = buf[n:].copy()
+        return buf[:n]
 
     def audio(self, syn, n):
         if self.tx:
@@ -516,9 +622,10 @@ class HF(Station):
             return syn.osc("hftune", 800.0, n) * 0.15
         if not self.rx_ok(True):
             return None
-        out = syn.noise(n) * (0.25 + 0.3 * self.rf.val)
+        # everything in receiver noise units (rms 1), then the AGC sets the audio level
+        x = syn.noise(n) * 4.0 + self._qrn(syn, n)
         for st, p, dm in self.active[:3]:
-            g = min(1.0, 10 ** ((p["snr"] - 16) / 20.0)) * 1.4
+            g = 10 ** (min(p["snr"], 70.0) / 20.0) * 4.0
             k, key = dm["kind"], "h" + st["key"]
             clip, pos = self.voice_pos(st) if k == "voice" else (None, 0)
             if clip is not None:
@@ -545,8 +652,27 @@ class HF(Station):
                 a = syn.fsk(key, n, 100, max(100.0, dm["centre"]), 170.0)
             if dm.get("het", 0) > 30:
                 a = a + syn.osc(key + "het", dm["het"], n) * 0.35
-            out = out + a * g
-        return out * self.af.val
+            x = x + a * g
+        rf = (0.1 if self.b_att.on else 1.0) * (0.05 + 0.95 * self.rf.val)
+        gmax = 0.12 * rf
+        if self.agc == "OFF":
+            y = np.tanh(x * gmax * 0.9) * 0.9
+        else:
+            nb = 16
+            L = n // nb
+            env = np.abs(x[:nb * L]).reshape(nb, L).max(axis=1)
+            tau = 0.12 if self.agc == "FAST" else 1.2
+            rel = 1 - math.exp(-L / SR / tau)
+            g = self._agc_g
+            gs = np.empty(nb)
+            for i in range(nb):
+                want = min(gmax, 0.55 / max(env[i], 1e-6))
+                g = want if want < g else g + (want - g) * rel
+                gs[i] = g
+            self._agc_g = g
+            gain = np.interp(np.arange(n), np.arange(nb) * L + L / 2.0, gs)
+            y = np.tanh(x * gain * 1.2) / 1.2
+        return self.spk(y) * self.af.val * 1.3
 
     # ------------------------------------------------------------------ draw
     def tip_at(self, pos):
@@ -574,7 +700,12 @@ class HF(Station):
         fg = C["lcdfg"]
         l = ui.lcd(s, (36, 80, 430, 150))
         lock = h["synth"]
+        if not self.on:
+            text(s, "OFF" if not self.pwr_b.on else "NO POWER - CHECK BREAKER", (l.centerx, l.centery), 18,
+                 (70, 110, 90), bold=True, align="m")
         ftxt = ("%9.2f" % (self.txf if self.tx else self.f)) if lock else " UNLOCK  "
+        if not self.on:
+            ftxt = ""
         text(s, ftxt, (l.x + 10, l.y + 4), 52, fg if not self.tx else C["red"], bold=True)
         text(s, "kHz", (l.x + 318, l.y + 34), 16, fg, bold=True)
         text(s, "%s %s" % (self.mode.value, EMISSION[self.mode.value]), (l.x + 362, l.y + 10), 13, C["amber"], bold=True)
@@ -587,7 +718,8 @@ class HF(Station):
         text(s, "CLAR %+d Hz" % self.rit.val, (l.x + 200, l.y + 86), 13, fg)
         text(s, "PWR %s" % self.pwr.value.split()[1], (l.x + 320, l.y + 86), 13, fg)
         wl = 299792.458 / self.f
-        text(s, "wavelength %.1f m   band noise %d dBm" % (wl, self.noise), (l.x + 12, l.y + 106), 11, C["dim"])
+        text(s, "wavelength %.1f m   band noise %d dBm   AGC %s%s" % (wl, self.noise, self.agc, "  NB" if self.nb_b.on else ""),
+             (l.x + 12, l.y + 106), 11, C["dim"])
         text(s, "ENTRY> " + self.entry + ("_" if int(w.t * 2) % 2 else " "), (l.x + 12, l.y + 126), 14, C["yellow"], bold=True)
         # meter
         sel = self.meter_sel.value
@@ -600,11 +732,15 @@ class HF(Station):
         elif sel == "SWR":
             v = self.swr if (self.tx or self.tuning_until) else 1.0
             ui.meter(s, r, (v - 1) / 4.0, "SWR  %.1f : 1" % v, [(0, "1"), (0.125, "1.5"), (0.25, "2"), (0.5, "3"), (1, "5")], red_from=0.5)
-        else:
+        elif sel == "IC":
             ic = self.po / 13.6 / 0.5 if self.po else (0.0)
             ui.meter(s, r, ic / 80.0, "PA CURRENT  %d A" % ic, [(0, "0"), (0.25, "20"), (0.5, "40"), (0.75, "60"), (1, "80")])
+        else:
+            ui.meter(s, r, (self.pa_temp - 20) / 80.0, "PA TEMP  %d C" % self.pa_temp,
+                     [(0, "20"), (0.25, "40"), (0.5, "60"), (0.75, "80"), (1, "100")], red_from=0.8)
         ui.led(s, (674, 206), "red", self.tx and self.po > 1, "ON AIR", 5)
         ui.led(s, (674, 224), "amber", (self.tx or bool(self.tuning_until)) and self.swr > 3, "HI SWR", 5)
+        ui.led(s, (674, 242), "red", self.pa_temp > 85 and int(w.t * 3) % 2 == 0, "PA HOT", 5)
         # spectrum
         r = ui.crt(s, (36, 420, 896, 130), (3, 7, 10), (20, 40, 60))
         lo, hi = PASS[self.mode.value]

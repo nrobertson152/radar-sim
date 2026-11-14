@@ -62,7 +62,7 @@ assert abs(app.world.lat + 33.9) < 0.6 and abs(app.world.lon - 18.4) < 0.6, "map
 for ch in "Hi there":
     app.handle(E(pygame.KEYDOWN, key=ord(ch.lower()), unicode=ch, mod=0))
 assert s.msg == "HI THERE"
-app.handle(E(pygame.KEYDOWN, key=pygame.K_F6, unicode="", mod=0))
+app.handle(E(pygame.KEYDOWN, key=pygame.K_F10, unicode="", mod=0))
 b = app.bench
 click((575, 320)); assert b.sel["R"] == "mix", "block select"
 click(b.b_s.rect.center); assert b.which == "S"

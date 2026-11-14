@@ -5,6 +5,11 @@ targets (R^-4), land, sea clutter, rain clutter and rain attenuation,
 receiver noise, tuning loss, then STC -> gain/threshold -> FTC, exactly in
 the order the real receiver applies them. The profile is painted on a
 decaying 'phosphor' buffer by the rotating sweep.
+
+ARPA only tracks what the radar actually sees: a target has to show an echo
+to be acquired and is declared LOST after several scans without one. True
+vectors are only as good as the gyro and speed log on the NAV / AIS tab; the
+guard zone alarm is driven by the same video, so clutter can trip it too.
 """
 import math
 import numpy as np
@@ -13,6 +18,7 @@ from . import ui, fx
 from .ui import C, text, Knob, Selector, Button, Station
 from .world import wrap180
 
+VMINS = [3, 6, 12]
 RANGES = [0.25, 0.5, 0.75, 1.5, 3, 6, 12, 24, 48]
 RINGS = {0.25: 0.05, 0.5: 0.1, 0.75: 0.25, 1.5: 0.25, 3: 0.5, 6: 1, 12: 2, 24: 4, 48: 8}
 # pulse: (length us, PRF Hz, system constant dB, IF bandwidth MHz)
@@ -22,6 +28,8 @@ HEALTH = ["psu", "trig", "mod", "mag", "dup", "ant", "trl", "mix", "lo", "ifa", 
 
 class Radar(Station):
     name = "RADAR"
+    power_key = "RADAR"
+    pan, bg_pan = -0.15, -0.6
     hint = ("Drag knobs or use the wheel (SHIFT = fine). Click a target on the PPI to acquire it "
             "(ARPA), right-click to drop. Hover any control for an explanation.")
     CX, CY, R = 384, 456, 340
@@ -45,6 +53,17 @@ class Radar(Station):
         self.cpa_alarm = False
         self.tinfo = []
         self.last_power = "OFF"
+        self.spin, self.scan = 0.0, 0
+        self.gerr, self.hdg_ok, self.mains = 0.0, True, True
+        self.rh = dict(w.rh)
+        self.gz_r0 = self.gz_r1 = None
+        self.gz_hits, self.gz_alarm, self.gz_quiet = 0, False, False
+        self.lost_alarm, self.hdg_alarm = False, False
+        self.ais_sel, self.msg, self.msg_t = None, "", -99.0
+        self.vmin_i = 1
+        self._ntx_t = 0.0
+        self._last_band, self._last_pulse = 0, 1
+        self.flags = {}
 
         y = 132
         self.power = self.add(Selector(820, y, 22, "POWER", ["OFF", "STBY", "TX"], 0,
@@ -123,6 +142,24 @@ class Radar(Station):
             "the same band causes interference. Remove it with IR.", toggle=True))
         self.sol_b = self.add(Button((1390, 452, 82, 34), "NAMES", "INSTRUCTOR: label the true "
             "position of every contact (training aid).", toggle=True))
+        self.wind = self.add(Knob(1532, 448, 20, "WIND FROM", 0, 360, w.wind, "INSTRUCTOR: wind direction. Sea "
+            "clutter is stronger and extends further on the windward side.", wrap=True, step=5,
+            fmt=lambda v: "%03d°" % v))
+        bx, bw = 1292, 52
+        self.vect_b = self.add(Button((bx, 708, bw, 34), "VECT\nTRUE", "ARPA VECTOR MODE: TRUE vectors show each "
+            "target's course and speed over the water (needs gyro + log); RELATIVE vectors point along the line of "
+            "relative motion - if a relative vector passes through your own ship, she will hit you.", size=9))
+        self.vtime_b = self.add(Button((bx + 57, 708, bw, 34), "VECT\n6 MIN", "Vector length in minutes (3 / 6 / 12): "
+            "the vector tip is where the target will be after that time.", size=9))
+        self.ais_b = self.add(Button((bx + 114, 708, bw, 34), "AIS", "AIS OVERLAY: triangles at the positions the "
+            "targets REPORT by AIS (they lag the radar by their reporting interval). Click one to read its AIS data. "
+            "Not every craft carries AIS - radar is primary.", toggle=True, size=10))
+        self.gz_b = self.add(Button((bx + 171, 708, bw, 34), "GUARD\nZONE", "GUARD ZONE: a ring from the VRM range "
+            "out to 0.5 NM beyond it. Any echo that paints inside it sounds the alarm - set the VRM first. "
+            "Clutter and rain set it off too, so set STC / FTC sensibly.", toggle=True, size=9))
+        self.pm_b = self.add(Button((bx + 228, 708, bw, 34), "PERF\nMON", "PERFORMANCE MONITOR: an echo box near the "
+            "scanner paints an arc on a fixed bearing. Its length shows overall transmitter and receiver performance - "
+            "a short arc means the radar is out of tune or losing power.", toggle=True, size=9))
 
     # ------------------------------------------------------------- display
     def _build_lut(self):
@@ -188,7 +225,13 @@ class Radar(Station):
 
     @property
     def rot(self):
-        return 0.0 if self.nup.on else self.world.hdg
+        """Rotation applied to true bearings for display (gyro-referenced)."""
+        return -self.gerr if self.nup.on else self.world.hdg
+
+    @property
+    def erot(self):
+        """Reference of the EBL / cursor readouts: gyro north or gyro heading."""
+        return 0.0 if self.nup.on else (self.world.hdg + self.gerr)
 
     def to_xy(self, rng, brg):
         a = math.radians(brg - self.rot)
@@ -196,27 +239,38 @@ class Radar(Station):
         return self.CX + math.sin(a) * k, self.CY - math.cos(a) * k
 
     def from_xy(self, pos):
+        """(range, TRUE bearing) of a screen point."""
         dx, dy = pos[0] - self.CX, pos[1] - self.CY
         return math.hypot(dx, dy) / self.R * self.rmax, (math.degrees(math.atan2(dx, -dy)) + self.rot) % 360
+
+    def echo_at(self, pos, rad=7):
+        x0, y0 = int(pos[0] - (self.CX - self.R)), int(pos[1] - (self.CY - self.R))
+        xa, xb, ya, yb = max(0, x0 - rad), min(self.D, x0 + rad + 1), max(0, y0 - rad), min(self.D, y0 + rad + 1)
+        if xa >= xb or ya >= yb:
+            return 0.0
+        return float(self.E[xa:xb, ya:yb].max())
+
+    def note(self, msg):
+        self.msg, self.msg_t = msg, self.world.t
 
     # --------------------------------------------------------------- state
     @property
     def transmitting(self):
-        return self.power.value == "TX" and self.warm <= 0
+        return self.power.value == "TX" and self.warm <= 0 and self.rh["psu"]
 
     @property
     def tx_ok(self):
-        h = self.world.rh
+        h = self.rh
         return self.transmitting and all(h[k] for k in ("psu", "trig", "mod", "mag", "dup"))
 
     @property
     def rx_ok(self):
-        h = self.world.rh
+        h = self.rh
         return all(h[k] for k in ("psu", "dup", "mix", "lo", "ifa", "det", "vid"))
 
     @property
     def disp_ok(self):
-        h = self.world.rh
+        h = self.rh
         return self.power.value != "OFF" and h["psu"] and h["dsp"]
 
     def handle(self, ev):
@@ -232,40 +286,111 @@ class Radar(Station):
                     d = math.hypot(x - ev.pos[0], y - ev.pos[1])
                     if d < bd:
                         best, bd = c, d
+                seen = self.echo_at(ev.pos) > 0.3
+                if ev.button == 1 and self.ais_b.on:          # the nearer of AIS symbol and echo wins
+                    m, dm = self._ais_near(ev.pos, True)
+                    if m is not None and (best is None or dm <= bd):
+                        self.ais_sel, self.sel = m, None
+                        ui.sfx("probe")
+                        return True
                 if best:
                     tr = next((t for t in self.tracks if t["c"] is best), None)
                     if ev.button == 3:
                         if tr:
                             self.tracks.remove(tr)
                             self.sel = None if self.sel is tr else self.sel
-                    elif tr:
-                        self.sel = tr
-                    elif len(self.tracks) < 10:
+                            ui.sfx("drop")
+                        return True
+                    if tr:
+                        self.sel, self.ais_sel = tr, None
+                        return True
+                    if seen and len(self.tracks) < 10:
                         ui.sfx("acquire")
-                        self.sel = dict(c=best, t0=self.world.t, n=1 + max([t["n"] for t in self.tracks] + [0]))
+                        self.sel = dict(c=best, t0=self.world.t, n=1 + max([t["n"] for t in self.tracks] + [0]),
+                                        hist=[], ht=self.world.t, miss=0, hit=True, lost=False)
                         self.tracks.append(self.sel)
+                        self.ais_sel = None
+                        self.flags["acquired"] = self.world.t
+                        return True
+                    if len(self.tracks) >= 10:
+                        ui.sfx("error", 0.6)
+                        self.note("TRACK TABLE FULL (10)")
+                        return True
+                if ev.button == 1 and self.ais_b.on:
+                    m = self._ais_near(ev.pos)
+                    if m is not None:
+                        self.ais_sel, self.sel = m, None
+                        ui.sfx("probe")
+                        return True
+                if ev.button == 1:
+                    ui.sfx("error", 0.5)
+                    self.note("NO ECHO AT CURSOR - CANNOT ACQUIRE")
                 return True
         return False
+
+    def _ais_near(self, pos, dist=False):
+        best, bd = None, 13
+        for m, r in self.world.ais.items():
+            rng, brg = self._rb(r["x"], r["y"])
+            if rng > self.rmax:
+                continue
+            x, y = self.to_xy(rng, brg)
+            d = math.hypot(x - pos[0], y - pos[1])
+            if d < bd:
+                best, bd = m, d
+        return (best, bd) if dist else best
+
+    def _rb(self, x, y):
+        w = self.world
+        dx, dy = x - w.x, y - w.y
+        return math.hypot(dx, dy), math.degrees(math.atan2(dx, dy)) % 360
 
     def tip_at(self, pos):
         t = super().tip_at(pos)
         if t:
             return t
         if math.hypot(pos[0] - self.CX, pos[1] - self.CY) < self.R:
-            return ("PPI: bright yellow = echoes, blue = trails. Left-click an echo to ACQUIRE it "
-                    "(ARPA plots it for ~10 s then shows course, speed, CPA and TCPA). Right-click to drop.")
+            return ("PPI: bright = echoes, blue = trails. Left-click an echo to ACQUIRE it (ARPA plots it for ~10 s "
+                    "then shows course, speed, CPA and TCPA); right-click to drop. With AIS on, click a triangle for its AIS data.")
         if pygame.Rect(770, 520, 500, 340).collidepoint(pos):
-            return ("A-SCAN: receiver video along the EBL. Grey = signal before the threshold (dB "
-                    "above noise), orange = gain reduction applied by STC, green = final video sent to the display.")
+            return ("A-SCAN: receiver video along the EBL. Grey = signal before the threshold (dB above noise), "
+                    "orange = gain reduction applied by STC, green = final video sent to the display.")
         return ""
 
     # -------------------------------------------------------------- update
     def update(self, dt):
-        w, h = self.world, self.world.rh
+        w = self.world
+        app = self.app
+        mains = self.powered
+        self.rh = dict(w.rh)
+        self.rh["psu"] = w.rh["psu"] and mains
+        h = self.rh
+        if mains != self.mains:
+            self.mains = mains
+            if not mains:
+                self.warm = 20.0
+                self.clear()
+                self.tracks, self.sel = [], None
+            elif self.power.value != "OFF":
+                ui.sfx("degauss", 0.8, pan=self.bg_pan)
+        nav = getattr(app, "nav", None)
+        self.hdg_ok = nav.gyro_ok if nav is not None else True
+        self.gerr = nav.gyro_error() if (nav is not None and self.hdg_ok) else 0.0
+        if not self.hdg_ok and self.nup.on:
+            self.nup.on = False
+            self.clear()
+            self.hdg_alarm = True
+            self.note("HEADING INPUT FAILED - HEAD-UP UNSTABILISED")
+        if self.hdg_ok:
+            self.hdg_alarm = False
         p = self.power.value
         if p != self.last_power:
             if self.last_power == "OFF":
                 self.warm = 20.0
+                if h["psu"]:
+                    ui.sfx("degauss", 0.9)
+            elif p == "OFF":
+                ui.sfx("pwroff", 0.7)
             if p != "TX":
                 self.clear()
             self.last_power = p
@@ -277,8 +402,18 @@ class Radar(Station):
                 ui.sfx("warm")
         if self.transmitting != getattr(self, "_was_tx", False):
             self._was_tx = self.transmitting
-            ui.sfx("relay", 1.0)
+            ui.sfx("hv" if self.transmitting else "relay", 1.0)
+        if self.band.idx != self._last_band:
+            self._last_band = self.band.idx
+            self.clear()
+            if p != "OFF":
+                ui.sfx("relay", 0.9)
+        if self.pulse.idx != self._last_pulse:
+            self._last_pulse = self.pulse.idx
+            if p != "OFF":
+                ui.sfx("relay2", 0.8)
         w.hdg, w.spd, w.sea = self.hdg.val % 360, self.spd.val, int(self.sea.val)
+        w.wind = self.wind.val % 360
         w.interference = self.int_b.on
         if self.rain_b.pop():
             w.rain = [[w.x + 3.5, w.y - 1.5, 2.2, 14.0, -6.0, 3.0],
@@ -293,13 +428,44 @@ class Radar(Station):
             self.ri += 1
             self.clear()
         if self.nup.pop():
+            if self.nup.on and not self.hdg_ok:
+                self.nup.on = False
+                ui.sfx("error", 0.7)
+                self.note("NORTH-UP NEEDS A GYRO INPUT")
+                self.mistake("north-up selected with no valid gyro heading - check the NAV / AIS tab.")
             self.clear()
         if self.pi_b.pop():
             self.clear()
         if self.drop.pop():
             self.tracks, self.sel = [], None
+        if self.vect_b.pop():
+            self.vect_rel = not getattr(self, "vect_rel", False)
+        self.vect_b.label = "VECT\nREL" if getattr(self, "vect_rel", False) else "VECT\nTRUE"
+        if self.vtime_b.pop():
+            self.vmin_i = (self.vmin_i + 1) % len(VMINS)
+        self.vtime_b.label = "VECT\n%d MIN" % VMINS[self.vmin_i]
+        if self.gz_b.pop():
+            if self.gz_b.on:
+                self.gz_r0 = self.vrm.val * self.rmax
+                self.gz_r1 = self.gz_r0 + (0.5 if self.rmax >= 3 else self.rmax / 6.0)
+                self.gz_alarm = self.gz_quiet = False
+                self.flags["gz_set"] = w.t
+            else:
+                self.gz_alarm = False
         if self.ack.pop():
+            if self.cpa_alarm or self.gz_alarm or self.lost_alarm:
+                self.flags["alarm_ack"] = w.t
             self.cpa_alarm = False
+            if self.gz_alarm:
+                self.gz_alarm, self.gz_quiet = False, True
+            if self.lost_alarm:
+                self.lost_alarm = False
+                lost = [t for t in self.tracks if t.get("lost")]
+                for t in lost:
+                    self.tracks.remove(t)
+                    if self.sel is t:
+                        self.sel = None
+            self.hdg_alarm = False
         if not self.trails.on:
             self.T[:] = 0
         # magnetron drift and tuning
@@ -318,7 +484,16 @@ class Radar(Station):
         self.r = (np.arange(self.NR) + 0.5) / self.NR * self.rmax
         self.dr = self.rmax / self.NR
         self.tinfo = [(c,) + w.rb(c) for c in w.contacts if c.active]
-        # tracks
+        # tracks: own speed and heading as the sensors report them
+        ls = nav.log_speed() if nav is not None else w.spd
+        self.own_meas = ((w.spd if ls is None else ls) if nav is not None else w.spd, w.hdg + self.gerr, ls is not None)
+        if not self.transmitting:
+            self._ntx_t += dt
+            if self._ntx_t > 5.0 and self.tracks:
+                self.tracks, self.sel = [], None
+                self.note("TRANSMITTER OFF - ALL TRACKS CANCELLED")
+        else:
+            self._ntx_t = 0.0
         danger = False
         for t in list(self.tracks):
             c = t["c"]
@@ -327,25 +502,35 @@ class Radar(Station):
                 self.tracks.remove(t)
                 continue
             t["rng"], t["brg"] = rng, brg
-            t["ready"] = (w.t - t["t0"]) > 10
+            was = t.get("ready", False)
+            t["ready"] = (w.t - t["t0"]) > 10 and not t.get("lost")
+            if t["ready"] and not was:
+                ui.sfx("ready", 0.6)
+            if w.t - t["ht"] > 12:
+                t["ht"] = w.t
+                t["hist"] = (t["hist"] + [(c.x, c.y)])[-8:]
+            cp, tc, _, _ = w.cpa(c)
+            t["tcpa"], t["cpa"] = tc, cp
             a, b = math.radians(c.cog), math.radians(w.hdg)
-            vx, vy = c.sog * math.sin(a) - w.spd * math.sin(b), c.sog * math.cos(a) - w.spd * math.cos(b)
-            dx, dy = c.x - w.x, c.y - w.y
-            v2 = vx * vx + vy * vy
-            tc = -(dx * vx + dy * vy) / v2 if v2 > 1e-6 else 0.0
-            t["tcpa"] = tc * 60
-            t["cpa"] = math.hypot(dx + vx * tc, dy + vy * tc) if tc > 0 else rng
+            rvx, rvy = c.sog * math.sin(a) - w.spd * math.sin(b), c.sog * math.cos(a) - w.spd * math.cos(b)
+            ms, mh, _ = self.own_meas
+            mb = math.radians(mh)
+            tvx, tvy = rvx + ms * math.sin(mb), rvy + ms * math.cos(mb)
+            t["rv"], t["tv"] = (rvx, rvy), (tvx, tvy)
+            t["crs"], t["spd"] = math.degrees(math.atan2(tvx, tvy)) % 360, math.hypot(tvx, tvy)
             t["danger"] = t["ready"] and t["cpa"] < 0.5 and 0 < t["tcpa"] < 20
             danger = danger or t["danger"]
         if danger and not getattr(self, "_was_danger", False):
             self.cpa_alarm = True
         self._was_danger = danger
-        self.alert = self.cpa_alarm
-        # sweep
+        self.alert = self.cpa_alarm or self.gz_alarm or self.lost_alarm
+        # sweep: the scanner needs a few seconds to run up to speed
+        spin_t = 1.0 if (self.transmitting and h["ant"]) else 0.0
+        self.spin += max(-0.25 * dt, min(0.45 * dt, spin_t - self.spin))
         self.E *= math.exp(-dt / 12.0)
         if self.transmitting and h["trig"] and self.disp_ok:
             if h["ant"]:
-                new = self.ang + 144.0 * dt
+                new = self.ang + 144.0 * max(0.02, self.spin) * dt
             else:
                 new = self.ang + 1e-9
             steps = min(40, int(new * 2) - int(self.ang * 2)) if h["ant"] else 1
@@ -354,21 +539,55 @@ class Radar(Station):
                 azr = ((base + i) / 2.0) % 360
                 azt = (azr + w.hdg) % 360
                 self.paint(azt, azr)
+            if new >= 360:
+                self._scan_done()
             self.ang = new % 360
+
+    def _scan_done(self):
+        """Once per antenna revolution: ARPA track maintenance and the guard zone."""
+        w = self.world
+        self.scan += 1
+        for t in self.tracks:
+            if t.get("lost") or t.get("rng", 99) >= self.rmax * 0.98:
+                t["hit"] = False
+                continue
+            if t.get("hit"):
+                t["miss"] = 0
+            else:
+                t["miss"] = t.get("miss", 0) + 1
+                if t["miss"] >= 4:
+                    t["lost"], t["lost_t"] = True, w.t
+                    self.lost_alarm = True
+                    self.flags["lost"] = w.t
+                    ui.sfx("lost", 0.9, pan=self.pan)
+            t["hit"] = False
+        if self.gz_b.on and self.gz_r0 is not None:
+            if self.gz_hits >= 2:
+                if not self.gz_quiet and not self.gz_alarm:
+                    self.gz_alarm = True
+                    self.flags["gz_alarm"] = w.t
+            else:
+                self.gz_quiet = False
+        self.gz_hits = 0
 
     def bg_audio(self, syn, n):
         """Transformer hum, scanner motor, the modulator singing at the PRF, alarms."""
         k = 1.0 if self.app.station is self else 0.3
         out = None
-        if self.power.value != "OFF" and self.world.rh["psu"]:
+        if self.power.value != "OFF" and self.rh["psu"]:
             out = syn.osc("rxf", 100.0, n) * 0.005 * k
-            if self.transmitting:
-                if self.world.rh["ant"]:
-                    out = out + (syn.rumble("rmot", n, 26) * 0.05 + syn.osc("rmot2", 87.0, n) * 0.012) * k
-                if self.tx_ok:
-                    out = out + syn.whine("prf", PULSES[self.pulse.value][1], n) * 0.012 * k
+        if self.spin > 0.01:
+            sp = self.spin
+            m = (syn.rumble("rmot", n, 26) * 0.05 + syn.osc("rmot2", 87.0 * (0.35 + 0.65 * sp), n) * 0.012) * k * sp
+            out = m if out is None else out + m
+        if self.tx_ok:
+            out = (0 if out is None else out) + syn.whine("prf", PULSES[self.pulse.value][1], n) * 0.012 * k
         if self.cpa_alarm:
             out = (0 if out is None else out) + syn.beep("cpa", n, 2300.0, 3.0) * 0.3
+        if self.gz_alarm:
+            out = (0 if out is None else out) + syn.warble("gz", n, 1000.0, 1500.0, 5.0) * 0.25
+        if self.lost_alarm:
+            out = (0 if out is None else out) + syn.beep("lost", n, 1250.0, 1.5) * 0.22
         return out
 
     def paint(self, azt, azr):
@@ -382,10 +601,25 @@ class Radar(Station):
             self.Ef[pix] = vals
         if self.trails.on:
             self.Tf[pix] = np.maximum(self.Tf[pix] * 0.975, vals > 0.4)
+        dr = self.dr
+        for t in self.tracks:
+            if t.get("lost") or "brg" not in t or t["rng"] >= self.rmax:
+                continue
+            if abs(wrap180(t["brg"] - azt)) < 0.6:
+                i0 = int(t["rng"] / dr)
+                seg = v[max(0, i0 - 2):i0 + 4]
+                if seg.size and seg.max() > 0.4:
+                    t["hit"] = True
+        if self.gz_b.on and self.gz_r0 is not None:
+            i0, i1 = int(self.gz_r0 / dr), int(self.gz_r1 / dr) + 1
+            if i0 < self.NR:
+                seg = v[i0:min(i1, self.NR)]
+                if seg.size and seg.max() > 0.5:
+                    self.gz_hits += 1
 
     def ray(self, azt, azr):
         """Range profile (0..1 video) for one antenna bearing."""
-        w, h, NR, r, dr = self.world, self.world.rh, self.NR, self.r, self.dr
+        w, h, NR, r, dr = self.world, self.rh, self.NR, self.r, self.dr
         tau, prf, Cdb, bwif = PULSES[self.pulse.value]
         X = self.band.idx == 0
         bw = 1.2 if X else 1.9
@@ -417,7 +651,7 @@ class Radar(Station):
             if w.sea > 0:
                 up = 1 + 0.6 * math.cos(math.radians(azt - w.wind))
                 sdb = Cdb - 22 + 7 * w.sea - (0 if X else 8) + 7 * math.log10(tau / 0.08) \
-                    - 30 * np.log10(np.maximum(r, 0.02) / 0.5) - (r / (0.5 + 0.45 * w.sea)) ** 2 * 6
+                    - 30 * np.log10(np.maximum(r, 0.02) / 0.5) - (r / ((0.5 + 0.45 * w.sea) * (0.75 + 0.25 * up))) ** 2 * 6
                 P += 10 ** (np.minimum(sdb, 90) / 10) * up * rng.exponential(1.0, NR)
             hroot = math.sqrt(w.h_ant)
             for c, trng, tbrg in self.tinfo:
@@ -441,22 +675,38 @@ class Radar(Station):
                 snr = Cdb + 10 * math.log10(c.rcs) - 40 * math.log10(max(trng, 0.03)) + 20 * math.log10(g)
                 if trng > hz:
                     snr -= (trng - hz) * 8
-                if snr < -6:
-                    continue
-                span = max(1, int((pl + c.length / 1852.0 * 0.6) / dr) + 1)
-                P[i0:i0 + span] += 10 ** (snr / 10) * (0.35 + 0.65 * rng.exponential(1.0))
-                if c.kind == "racon" and a < bw * 0.8 and (w.t % 30) < 20:
-                    u = max(0.15, self.rmax / 40)
-                    pos = trng + u * 0.6
-                    for sym in c.racon:
-                        ln = u * (3 if sym == "-" else 1)
-                        P[int(pos / dr):int((pos + ln) / dr) + 1] += 2000.0
-                        pos += ln + u
+                if snr >= -6:
+                    span = max(1, int((pl + c.length / 1852.0 * 0.6) / dr) + 1)
+                    P[i0:i0 + span] += 10 ** (snr / 10) * (0.35 + 0.65 * rng.exponential(1.0))
+                    if c.kind == "racon" and a < bw * 0.8 and (w.t % 30) < 20:
+                        u = max(0.15, self.rmax / 40)
+                        pos = trng + u * 0.6
+                        for sym in c.racon:
+                            ln = u * (3 if sym == "-" else 1)
+                            P[int(pos / dr):int((pos + ln) / dr) + 1] += 2000.0
+                            pos += ln + u
+                # false echoes from big ships close by
+                if c.rcs >= 5000 and trng < 1.6:
+                    rel = (tbrg - w.hdg) % 360
+                    if a < bw and min(abs(rel - 90), abs(rel - 270)) < 25:        # multiple echoes, close abeam
+                        for k, att_db in ((2, 9.0), (3, 17.0)):
+                            j = int(k * trng / dr)
+                            if j < NR:
+                                P[j:j + 2] += 10 ** ((Cdb + 10 * math.log10(c.rcs) - 40 * math.log10(max(trng, 0.03)) - att_db) / 10)
+                    if abs(wrap180(azr - 168.0)) < bw * 0.7 and trng < 2.5:      # indirect echo off the funnel
+                        j = int(trng / dr)
+                        if j < NR:
+                            P[j:j + 2] += 10 ** ((Cdb + 10 * math.log10(c.rcs) - 40 * math.log10(max(trng, 0.03)) - 14) / 10)
             if X and getattr(w, "own_sart", False):   # our own SART alongside: concentric rings
                 for k in range(12):
                     i0 = int((0.03 + k * 0.64) / dr)
                     if i0 < NR:
                         P[i0:int((0.15 + k * 0.64 + pl) / dr) + 1] += 3000.0
+            if self.pm_b.on and 40.0 <= azr <= 70.0:                            # performance monitor arc
+                q = max(0.0, min(1.0, 1 + 10 * math.log10(max(self.sig_gain, 1e-6)) / 12.0))
+                r0 = self.rmax * 0.55
+                i0, i1 = int(r0 / dr), int((r0 + self.rmax * 0.28 * q) / dr)
+                P[i0:max(i0 + 1, i1)] += 2500.0 * q
             P *= 10 ** (-0.2 * att) * self.sig_gain
             if abs(wrap180(azr - 180)) < 5:
                 P *= 0.01                         # blind sector astern (mast/funnel shadow)
@@ -485,14 +735,14 @@ class Radar(Station):
                 v = np.clip(v - f * 1.25 * (cs[i] - cs[lo]) / np.maximum(i - lo, 1), 0, 1)
             if self.es.on:
                 v = np.maximum(v, np.maximum(np.concatenate(([0.0], v[:-1])), np.concatenate(([0.0, 0.0], v[:-2]))))
-        ab = self.ebl.val if self.ebl_on.on else w.hdg
+        ab = ((self.ebl.val - self.gerr) % 360) if self.ebl_on.on else w.hdg
         if abs(wrap180(azt - ab)) < 0.3:
             self.ascan = (vdb.copy(), v.copy())
         return v.astype(np.float32)
 
     # ---------------------------------------------------------------- draw
     def draw(self, s):
-        w, h = self.world, self.world.rh
+        w, h = self.world, self.rh
         cx, cy, R = self.CX, self.CY, self.R
         on = self.disp_ok
         if on and self.transmitting:
@@ -513,12 +763,12 @@ class Radar(Station):
                 p = self.to_xy(self.rmax, w.hdg)
                 pygame.draw.line(s, (90, 255, 150), (cx, cy), p, 1)
             if not self.nup.on:
-                a = math.radians(-w.hdg)
+                a = math.radians(-(w.hdg + self.gerr))
                 pygame.draw.polygon(s, C["cyan"], [(cx + math.sin(a) * (R - 2), cy - math.cos(a) * (R - 2)),
                                                    (cx + math.sin(a + 0.02) * (R - 14), cy - math.cos(a + 0.02) * (R - 14)),
                                                    (cx + math.sin(a - 0.02) * (R - 14), cy - math.cos(a - 0.02) * (R - 14))])
             if self.ebl_on.on:
-                a = math.radians(self.ebl.val - self.rot)
+                a = math.radians(self.ebl.val - self.erot)
                 for i in range(0, R, 12):
                     pygame.draw.line(s, C["cyan"], (cx + math.sin(a) * i, cy - math.cos(a) * i),
                                      (cx + math.sin(a) * (i + 7), cy - math.cos(a) * (i + 7)), 1)
@@ -529,8 +779,27 @@ class Radar(Station):
                     a1 = math.radians(i + 2)
                     pygame.draw.line(s, C["cyan"], (cx + math.sin(a0) * rr, cy - math.cos(a0) * rr),
                                      (cx + math.sin(a1) * rr, cy - math.cos(a1) * rr), 1)
+            if self.gz_b.on and self.gz_r0 is not None:
+                col = C["red"] if (self.gz_alarm and int(w.t * 3) % 2) else C["amber"]
+                for rg in (self.gz_r0, self.gz_r1):
+                    if rg < self.rmax:
+                        rr = rg / self.rmax * R
+                        for i in range(0, 360, 6):
+                            a0, a1 = math.radians(i), math.radians(i + 3)
+                            pygame.draw.line(s, col, (cx + math.sin(a0) * rr, cy - math.cos(a0) * rr),
+                                             (cx + math.sin(a1) * rr, cy - math.cos(a1) * rr), 2)
             if self.transmitting:
+                if self.ais_b.on:
+                    self._draw_ais(s)
                 self._draw_tracks(s)
+                nav = getattr(self.app, "nav", None)
+                if nav is not None and nav.mob:
+                    rng, brg = self._rb(nav.mob["x"], nav.mob["y"])
+                    if rng < self.rmax:
+                        x, y = self.to_xy(rng, brg)
+                        pygame.draw.circle(s, C["red"], (x, y), 7, 2)
+                        pygame.draw.line(s, C["red"], (x - 10, y), (x + 10, y), 2)
+                        text(s, "MOB", (x + 9, y + 4), 10, C["red"], bold=True)
                 if h["trig"]:
                     a = math.radians(self.ang + w.hdg - self.rot)
                     pygame.draw.line(s, (70, 200, 110), (cx, cy), (cx + math.sin(a) * R, cy - math.cos(a) * R), 2)
@@ -545,7 +814,7 @@ class Radar(Station):
                 if not h["psu"]:
                     msg = ""
                 text(s, msg, (cx, cy - 40), 34, (120, 255, 190), bold=True, align="m")
-                if self.power.value == "TX" and self.warm > 0:
+                if self.power.value == "TX" and self.warm > 0 and h["psu"]:
                     text(s, "TX INHIBITED UNTIL MAGNETRON IS WARM", (cx, cy + 10), 14, C["amber"], bold=True, align="m")
         pr = pygame.Rect(cx - R, cy - R, self.D, self.D)
         if on:
@@ -554,6 +823,7 @@ class Radar(Station):
         mult, add = fx.round_glass(R)
         s.blit(mult, pr, special_flags=pygame.BLEND_RGB_MULT)
         s.blit(add, pr, special_flags=pygame.BLEND_RGB_ADD)
+        ui.LIT.append(pr)
         for wr in ((12, 52, 170, 60), (598, 52, 158, 60), (12, 820, 200, 40), (588, 820, 168, 40)):
             ui.lcd(s, wr)
         if on:
@@ -561,22 +831,35 @@ class Radar(Station):
             tau, prf, _, _ = PULSES[self.pulse.value]
             text(s, "RANGE %g NM" % self.rmax, (20, 56), 15, g, bold=True)
             text(s, "RINGS %g NM" % RINGS[self.rmax], (20, 76), 12, g)
-            text(s, "%s-BAND  %s" % (self.band.value[0], self.pulse.value[0] + "P"), (20, 92), 12, g)
-            text(s, "N UP  RM" if self.nup.on else "H UP  RM", (750, 56), 15, g, bold=True, align="r")
-            text(s, "HDG %05.1f°" % w.hdg, (750, 76), 12, g, align="r")
-            text(s, "SPD %4.1f kn" % w.spd, (750, 92), 12, g, align="r")
+            text(s, "%s-BAND  %s%s" % (self.band.value[0], self.pulse.value[0] + "P", "  PM" if self.pm_b.on else ""), (20, 92), 12, g)
+            text(s, ("N UP  RM" if self.nup.on else "H UP  RM") if self.hdg_ok else "H UP  NO HDG", (750, 56), 15,
+                 g if self.hdg_ok else C["red"], bold=True, align="r")
+            text(s, ("HDG %05.1f°" % ((w.hdg + self.gerr) % 360)) if self.hdg_ok else "HDG ---.-", (750, 76), 12, g, align="r")
+            ms, _, lok = getattr(self, "own_meas", (w.spd, w.hdg, True))
+            text(s, ("SPD %4.1f kn LOG" % ms) if lok else "SPD --.- NO LOG", (750, 92), 12, g if lok else C["amber"], align="r")
             if self.ebl_on.on:
-                rel = (self.ebl.val - w.hdg) % 360
+                rel = (self.ebl.val - (w.hdg + self.gerr)) % 360
                 text(s, "EBL %05.1f°T  %05.1f°R" % (self.ebl.val, rel), (18, 823), 12, C["cyan"], bold=True)
             if self.vrm_on.on:
                 text(s, "VRM %6.3f NM" % (self.vrm.val * self.rmax), (18, 840), 12, C["cyan"], bold=True)
             m = ui.MOUSE
             if math.hypot(m[0] - cx, m[1] - cy) < R:
                 rng, brg = self.from_xy(m)
-                text(s, "CURSOR %05.1f°T" % brg, (750, 823), 12, g, align="r")
+                text(s, "CURSOR %05.1f°T" % ((brg + self.gerr) % 360), (750, 823), 12, g, align="r")
                 text(s, "%6.3f NM" % rng, (750, 840), 12, g, align="r")
-            if self.cpa_alarm and int(w.t * 2) % 2:
-                text(s, "COLLISION ALARM - CPA/TCPA", (cx, 50), 15, C["red"], bold=True, align="c")
+            al = []
+            if self.cpa_alarm:
+                al.append("COLLISION CPA/TCPA")
+            if self.gz_alarm:
+                al.append("GUARD ZONE")
+            if self.lost_alarm:
+                al.append("LOST TARGET")
+            if self.hdg_alarm:
+                al.append("HEADING FAIL")
+            if al and int(w.t * 2) % 2:
+                text(s, "ALARM: " + "  /  ".join(al), (cx, 50), 14, C["red"], bold=True, align="c")
+            elif w.t - self.msg_t < 4:
+                text(s, self.msg, (cx, 50), 13, C["amber"], bold=True, align="c")
 
         # panels
         ui.panel(s, (770, 52, 820, 150), "TRANSCEIVER")
@@ -595,33 +878,52 @@ class Radar(Station):
         if st == "TX" and self.warm > 0:
             st = "WARM-UP"
         if not h["psu"]:
-            st = "NO POWER"
+            st = "NO POWER" if not self.mains else "PSU FAULT"
         fg = C["lcdfg"]
         text(s, "STATE  %-8s" % st, (l.x + 10, l.y + 8), 13, fg, bold=True)
         text(s, "FREQ   %s MHz  %s" % ("9410" if X else "3050", "25 kW" if X else "30 kW"), (l.x + 10, l.y + 26), 13, fg)
         text(s, "PULSE  %.2f us  PRF %d Hz" % (tau, prf), (l.x + 10, l.y + 44), 13, fg)
-        text(s, "BEAM   %.1f° H   24 RPM" % (1.2 if X else 1.9), (l.x + 10, l.y + 62), 13, fg)
+        text(s, "BEAM   %.1f° H   %2d RPM" % (1.2 if X else 1.9, round(24 * self.spin)), (l.x + 10, l.y + 62), 13, fg)
         text(s, "TUNE", (l.x + 10, l.y + 82), 12, fg, bold=True)
         ui.bar(s, (l.x + 60, l.y + 82, 200, 13), self.tune_ind, "green")
         text(s, "MAG I", (l.x + 10, l.y + 100), 12, fg, bold=True)
         magi = {"SHORT": 0.35, "MEDIUM": 0.5, "LONG": 0.68}[self.pulse.value] if self.tx_ok else 0.0
         ui.bar(s, (l.x + 60, l.y + 100, 200, 13), magi, "amber")
         ui.led(s, (l.x + 300, l.y + 20), "red", self.tx_ok and int(w.t * 4) % 2 == 0, "TX")
-        ui.led(s, (l.x + 300, l.y + 44), "green", self.warm <= 0 and st != "NO POWER" and self.power.value != "OFF", "READY")
+        ui.led(s, (l.x + 300, l.y + 44), "green", self.warm <= 0 and h["psu"] and self.power.value != "OFF", "READY")
         ui.led(s, (l.x + 300, l.y + 68), "amber", self.afc.on, "AFC")
-        ui.led(s, (l.x + 300, l.y + 92), "red", self.cpa_alarm, "ALARM")
+        ui.led(s, (l.x + 300, l.y + 92), "red", self.alert, "ALARM")
         super().draw(s)
         self._draw_ascan(s)
         self._draw_arpa(s)
 
+    def _vec(self, s, x, y, vx, vy, col):
+        k = self.R / self.rmax * VMINS[self.vmin_i] / 60.0
+        a = math.radians(-self.rot)
+        ca, sa = math.cos(a), math.sin(a)
+        dx, dy = vx * ca + vy * sa, -vx * sa + vy * ca             # rotate the vector into display axes
+        pygame.draw.line(s, col, (x, y), (x + dx * k, y - dy * k), 2)
+
     def _draw_tracks(self, s):
         w = self.world
+        rel = getattr(self, "vect_rel", False)
         for t in self.tracks:
             if "rng" not in t or t["rng"] > self.rmax:
                 continue
-            c = t["c"]
             x, y = self.to_xy(t["rng"], t["brg"])
+            if t.get("lost"):
+                if int(w.t * 3) % 2:
+                    pygame.draw.polygon(s, C["red"], [(x, y - 11), (x + 11, y), (x, y + 11), (x - 11, y)], 2)
+                    pygame.draw.line(s, C["red"], (x - 8, y - 8), (x + 8, y + 8), 2)
+                    pygame.draw.line(s, C["red"], (x - 8, y + 8), (x + 8, y - 8), 2)
+                text(s, "%d LOST" % t["n"], (x + 12, y - 16), 11, C["red"], bold=True)
+                continue
             col = C["red"] if t.get("danger") else (C["green"] if t is self.sel else (150, 255, 200))
+            for hx, hy in t.get("hist", []):
+                rr, bb = self._rb(hx, hy)
+                if rr < self.rmax:
+                    px, py = self.to_xy(rr, bb)
+                    pygame.draw.circle(s, col, (px, py), 2)
             if not t.get("ready"):
                 pygame.draw.rect(s, col, (x - 9, y - 9, 18, 18), 1)
             else:
@@ -629,10 +931,39 @@ class Radar(Station):
                     pygame.draw.polygon(s, col, [(x, y - 13), (x + 12, y + 9), (x - 12, y + 9)], 2)
                 else:
                     pygame.draw.circle(s, col, (x, y), 9, 1)
-                k = self.R / self.rmax * 0.1                 # 6-minute true vector
-                a = math.radians(c.cog - self.rot)
-                pygame.draw.line(s, col, (x, y), (x + math.sin(a) * c.sog * k, y - math.cos(a) * c.sog * k), 2)
+                vx, vy = t["rv"] if rel else t["tv"]
+                self._vec(s, x, y, vx, vy, col)
             text(s, str(t["n"]), (x + 11, y - 16), 11, col, bold=True)
+
+    def _draw_ais(self, s):
+        w = self.world
+        for m, r in w.ais.items():
+            rng, brg = self._rb(r["x"], r["y"])
+            if rng > self.rmax:
+                continue
+            x, y = self.to_xy(rng, brg)
+            sel = m == self.ais_sel
+            if r["cls"] in ("SART", "MOB", "EPIRB"):
+                col = C["red"]
+                pygame.draw.circle(s, col, (x, y), 8, 2)
+                pygame.draw.line(s, col, (x - 6, y - 6), (x + 6, y + 6), 2)
+                pygame.draw.line(s, col, (x - 6, y + 6), (x + 6, y - 6), 2)
+                text(s, r["name"], (x + 10, y - 6), 10, col, bold=True)
+                continue
+            col = (255, 236, 120) if not sel else (255, 255, 255)
+            a = math.radians(r["cog"] - self.rot)
+            sa, ca = math.sin(a), math.cos(a)
+            tip = (x + sa * 10, y - ca * 10)
+            l_ = (x - sa * 5 - ca * 5, y + ca * 5 - sa * 5)
+            r_ = (x - sa * 5 + ca * 5, y + ca * 5 + sa * 5)
+            pygame.draw.polygon(s, col, [tip, l_, r_], 1 if not sel else 2)
+            if r["sog"] > 0.5:
+                k = self.R / self.rmax * VMINS[self.vmin_i] / 60.0 * r["sog"]
+                pygame.draw.line(s, col, tip, (x + sa * (10 + k), y - ca * (10 + k)), 1)
+            if sel or self.sol_b.on:
+                text(s, r["name"][:16], (x + 9, y + 4), 10, col, bold=True)
+            if sel:
+                pygame.draw.rect(s, col, (x - 13, y - 13, 26, 26), 1)
 
     def _draw_ascan(self, s):
         r = ui.crt(s, (792, 556, 458, 254))
@@ -641,14 +972,13 @@ class Radar(Station):
             pygame.draw.line(s, (26, 42, 44), (r.x, r.y + r.h * i / 5), (r.right, r.y + r.h * i / 5), 1)
         for i in range(6):
             text(s, "%g" % (self.rmax * i / 5), (r.x + r.w * i / 5, r.bottom + 9), 10, C["dim"], align="c")
-        text(s, "nm", (r.right - 2, r.bottom + 9), 10, C["dim"], align="r") if False else None
         text(s, "+80 dB", (r.x + 6, r.y + 4), 9, (60, 110, 80))
         if self.disp_ok and self.transmitting:
             vdb, v = self.ascan
             xs = r.x + (np.arange(self.NR) + 0.5) / self.NR * r.w
             raw = r.bottom - np.clip((vdb + 10) / 90.0, 0, 1) * r.h
             pygame.draw.lines(s, (95, 100, 108), False, list(zip(xs, raw)), 1)
-            if self.stc.val > 0 and self.world.rh["stc"]:
+            if self.stc.val > 0 and self.rh["stc"]:
                 rr = (np.arange(self.NR) + 0.5) / self.NR * self.rmax
                 a = self.stc.val * 65 * np.exp(-rr / (0.6 + 2.4 * self.stc.val))
                 pygame.draw.lines(s, C["amber"], False, list(zip(xs, r.y + a / 90.0 * r.h)), 1)
@@ -660,6 +990,10 @@ class Radar(Station):
             if self.vrm_on.on:
                 x = r.x + self.vrm.val * r.w
                 pygame.draw.line(s, C["cyan"], (x, r.y), (x, r.bottom), 1)
+            if self.gz_b.on and self.gz_r0 is not None and self.gz_r0 < self.rmax:
+                x0 = r.x + self.gz_r0 / self.rmax * r.w
+                x1 = r.x + min(1.0, self.gz_r1 / self.rmax) * r.w
+                pygame.draw.rect(s, (90, 60, 10), (x0, r.y, max(2, x1 - x0), 8))
         ui.led(s, (800, 842), (95, 100, 108), True, "RAW dB", 4)
         ui.led(s, (890, 842), "amber", True, "STC CUT", 4)
         ui.led(s, (990, 842), "green", True, "VIDEO OUT", 4)
@@ -667,27 +1001,52 @@ class Radar(Station):
 
     def _draw_arpa(self, s):
         x, y = 1296, 552
-        l = ui.lcd(s, (1292, 550, 284, 184))
+        l = ui.lcd(s, (1292, 550, 284, 150))
         fg = C["lcdfg"]
+        w = self.world
         t = self.sel if self.sel in self.tracks else None
-        if not t or "rng" not in t:
-            ui.text_block(s, "NO TARGET SELECTED\n \nClick an echo on the PPI to acquire. Up to 10 "
-                             "targets are tracked.", (x + 6, y + 6, 270, 170), 12, fg)
-        else:
-            c, w = t["c"], self.world
-            text(s, "TARGET %d %s" % (t["n"], "" if t["ready"] else "(ACQUIRING)"), (x + 6, y + 4), 14, fg, bold=True)
-            rows = [("BRG", "%05.1f° T" % t["brg"]), ("RNG", "%.2f NM" % t["rng"])]
+        ais = w.ais.get(self.ais_sel) if self.ais_sel is not None else None
+        if t and "rng" in t:
+            c = t["c"]
+            st = "LOST" if t.get("lost") else ("" if t["ready"] else "(ACQUIRING)")
+            text(s, "TARGET %d %s" % (t["n"], st), (x + 6, y + 4), 13, C["red"] if t.get("lost") else fg, bold=True)
+            rows = [("BRG", "%05.1f° T" % ((t["brg"] + self.gerr) % 360)), ("RNG", "%.2f NM" % t["rng"])]
             if t["ready"]:
-                rows += [("CRS", "%05.1f° T" % c.cog), ("SPD", "%.1f kn" % c.sog),
-                         ("CPA", "%.2f NM" % t["cpa"]),
-                         ("TCPA", "%.1f min" % t["tcpa"] if t["tcpa"] > 0 else "PAST")]
+                rows += [("CRS", "%05.1f° T" % t["crs"]), ("SPD", "%.1f kn" % t["spd"]),
+                         ("CPA", "%.2f NM" % t["cpa"]), ("TCPA", "%.1f min" % t["tcpa"] if t["tcpa"] > 0 else "PAST")]
             else:
                 rows += [("CRS", "---"), ("SPD", "---"), ("CPA", "---"), ("TCPA", "---")]
             for i, (k, v) in enumerate(rows):
                 col = C["red"] if t.get("danger") and k in ("CPA", "TCPA") else fg
-                text(s, k, (x + 6, y + 30 + i * 24), 15, col, bold=True)
-                text(s, v, (x + 270, y + 30 + i * 24), 15, col, bold=True, align="r")
-        ui.text_block(s, "CPA limit 0.5 NM / TCPA limit 20 min. Vectors are TRUE, 6 minutes long. "
-                         "Tracked: %d/10. Minimum range with this pulse: %d m." %
-                      (len(self.tracks), int(PULSES[self.pulse.value][0] * 150) + 15),
-                      (1292, 744, 286, 110), 11, C["dim"], mono=False)
+                text(s, k, (x + 6, y + 24 + i * 20), 13, col, bold=True)
+                text(s, v, (x + 272, y + 24 + i * 20), 13, col, bold=True, align="r")
+        elif ais:
+            rng, brg = self._rb(ais["x"], ais["y"])
+            text(s, "AIS  %s" % ais["name"][:20], (x + 6, y + 4), 13, (255, 236, 120), bold=True)
+            rows = [("MMSI", "%09d" % ais["mmsi"]), ("CALL", ais["cs"] or "-"), ("BRG/RNG", "%05.1f° %.2f" % (brg, rng)),
+                    ("COG/SOG", "%05.1f° %.1f" % (ais["cog"], ais["sog"])), ("REPORT", "%d s ago" % (w.t - ais["t"])),
+                    ("CLASS", ais["cls"])]
+            for i, (k, v) in enumerate(rows):
+                text(s, k, (x + 6, y + 24 + i * 20), 12, fg, bold=True)
+                text(s, v, (x + 272, y + 24 + i * 20), 12, fg, bold=True, align="r")
+        else:
+            ui.text_block(s, "NO TARGET SELECTED\n \nClick an echo on the PPI to acquire (max 10). With AIS on, click a "
+                             "triangle to read its AIS data.", (x + 6, y + 6, 270, 140), 12, fg)
+        ms, mh, lok = getattr(self, "own_meas", (w.spd, w.hdg, True))
+        warn = []
+        if not self.hdg_ok:
+            warn.append("NO GYRO: TRUE VECTORS INVALID")
+        elif abs(self.gerr) > 0.3:
+            warn.append("GYRO ERROR %+.1f°" % self.gerr)
+        if not lok:
+            warn.append("NO LOG: OWN SPEED 0")
+        elif abs(ms - w.spd) > 0.2:
+            warn.append("LOG ERROR %+.1f kn" % (ms - w.spd))
+        info = ("Vectors %s %d min. CPA limit 0.5 NM / TCPA 20 min. Tracked %d/10. Min range this pulse %d m." %
+                ("RELATIVE" if getattr(self, "vect_rel", False) else "TRUE", VMINS[self.vmin_i], len(self.tracks),
+                 int(PULSES[self.pulse.value][0] * 150) + 15))
+        if self.gz_b.on and self.gz_r0 is not None:
+            info += " Guard zone %.2f - %.2f NM." % (self.gz_r0, self.gz_r1)
+        if warn:
+            text(s, "  ".join(warn), (1294, 750), 11, C["amber"], bold=True)
+        ui.text_block(s, info, (1292, 768 if warn else 752, 286, 92), 11, C["dim"], mono=False)

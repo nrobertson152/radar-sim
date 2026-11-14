@@ -123,11 +123,35 @@ class Src:
 
 class Contact(Src):
     def __init__(self, name, kind, x, y, cog=0, sog=0, rcs=100, h=10, length=20,
-                 mmsi=0, cs="", racon="", box=None, active=True):
+                 mmsi=0, cs="", racon="", box=None, active=True, ais=None):
         super().__init__(name, x, y, h, 25.0, mmsi)
         self.kind, self.cog, self.sog, self.rcs, self.length = kind, cog, sog, rcs, length
         self.cs, self.racon, self.active = cs, racon, active
         self.box = box or (-26, 26, -22, 4.2)
+        self.ais = (mmsi > 0 and kind in ("ship", "boat", "aircraft")) if ais is None else ais
+        self.ais_class = "A" if kind == "ship" else ("SAR" if kind == "aircraft" else "B")
+        self.home = self.on_scene = False
+
+
+COMPASS16 = ["NORTH", "NORTH NORTH EAST", "NORTH EAST", "EAST NORTH EAST", "EAST", "EAST SOUTH EAST",
+             "SOUTH EAST", "SOUTH SOUTH EAST", "SOUTH", "SOUTH SOUTH WEST", "SOUTH WEST", "WEST SOUTH WEST",
+             "WEST", "WEST NORTH WEST", "NORTH WEST", "NORTH NORTH WEST"]
+
+
+def compass_word(deg):
+    return COMPASS16[int(((deg % 360) + 11.25) // 22.5) % 16]
+
+
+def side_word(rel):
+    """Relative bearing -> 'STARBOARD BOW' etc."""
+    rel %= 360
+    if rel < 10 or rel > 350:
+        return "BOW, RIGHT AHEAD"
+    for lim, w in ((67.5, "STARBOARD BOW"), (112.5, "STARBOARD BEAM"), (170, "STARBOARD QUARTER"),
+                   (190, "STERN"), (247.5, "PORT QUARTER"), (292.5, "PORT BEAM"), (350, "PORT BOW")):
+        if rel < lim:
+            return w
+    return "PORT BOW"
 
 
 class Msg:
@@ -255,6 +279,14 @@ VHF_SCRIPT = [
     [(457.525, "DECK", "BRIDGE, DECK. FORWARD MOORING STATION SECURED, ANCHORS CLEARED AWAY. OVER.")],
     [(123.1, "RESCUE 193", "PENHALE COASTGUARD, RESCUE 193 ON 123 DECIMAL 1. COMMENCING SEARCH "
       "PATTERN, TWO HOURS ENDURANCE. OVER.")],
+    [("DSC", "CG", dict(cat="INDIVIDUAL", ch=67, text=(
+        "MV TRAINER, THIS IS PENHALE COASTGUARD ON CHANNEL 67. WE HAVE A REPORT OF A SMALL BOAT "
+        "WITH ENGINE FAILURE ABOUT 4 MILES SOUTH OF YOU. PLEASE KEEP A SHARP LOOKOUT AND REPORT "
+        "ANY SIGHTING ON THIS CHANNEL. OVER.")))],
+    [(16, "CG", "SECURITE, SECURITE, SECURITE. ALL STATIONS, THIS IS PENHALE COASTGUARD. "
+      "FOR A GALE WARNING AND NAVIGATIONAL WARNINGS LISTEN CHANNEL 67. OUT."),
+     (67, "CG", "ALL STATIONS, THIS IS PENHALE COASTGUARD. GALE WARNING. SOUTHWEST GALE FORCE 8 "
+      "EXPECTED SOON IN SEA AREAS LUNDY, FASTNET AND PLYMOUTH. OUT.")],
 ]
 
 
@@ -284,7 +316,7 @@ class World:
             C("PENHALE FERRY", "ship", 2.6, 4.6, 150, 19, 8000, 20, 110, 232004321, "MPFY",
               box=(-1, 8, -3, 4.9)),
             C("FV MORVORAN", "boat", 3.2, -2.6, 300, 4, 40, 5, 18, 235087650, "MVRN"),
-            C("SY KITTIWAKE", "boat", -1.8, 1.4, 110, 5, 4, 3, 11, 235911222, "MKTW"),
+            C("SY KITTIWAKE", "boat", -1.8, 1.4, 110, 5, 4, 3, 11, 235911222, "MKTW", ais=False),
             C("FAIRWAY BUOY", "racon", 2.2, 3.6, rcs=15, h=5, length=3, racon="--"),
             C("S CARDINAL BUOY", "buoy", -4.0, 1.6, rcs=8, h=4, length=2),
             C("ISLAND BUOY", "buoy", 6.0, -5.3, rcs=8, h=4, length=2),
@@ -307,6 +339,13 @@ class World:
         # equipment health, altered by the fault-finding bench
         self.rh = {k: True for k in RADAR_BLOCKS}
         self.hh = {k: True for k in SSB_BLOCKS}
+        self.pob = 12
+        # AIS: last report heard from each transponder (keyed by MMSI)
+        self.ais, self._ais_next = {}, {}
+        self.ais_device = None                    # AIS-SART / MOB / EPIRB-AIS placed by the instructor
+        # collision watch: ships that call you on CH16 when you are standing into danger
+        self._cw_next, self._b2b, self.b2b_call = 0.0, {}, None
+        self.events = {}                          # one-off world events (helicopter on scene ...)
 
     # -------------------------------------------------------------- terrain
     def _make_land(self):
@@ -365,11 +404,15 @@ class World:
         self.x += self.spd * math.sin(a) * dt / 3600
         self.y += self.spd * math.cos(a) * dt / 3600
         for c in self.contacts:
+            if c.home and c.active:
+                self._home(c)
             if not c.active or not c.sog:
                 continue
             a = math.radians(c.cog)
             c.x += c.sog * math.sin(a) * dt / 3600
             c.y += c.sog * math.cos(a) * dt / 3600
+            if c.home:
+                continue
             x0, x1, y0, y1 = c.box
             if not (x0 <= c.x <= x1 and y0 <= c.y <= y1):
                 c.cog = (c.cog + 180) % 360
@@ -384,12 +427,104 @@ class World:
             seq = VHF_SCRIPT[self._seq % len(VHF_SCRIPT)]
             ch, who, txt = seq[self._seq_i]
             src = self.srcs[who]
-            m = self.say(ch, src, txt)
+            if ch == "DSC":
+                m = self.say(70, src, "", kind="dsc", dsc=dict(txt, to=self.mmsi))
+            else:
+                m = self.say(ch, src, txt)
             self._next = m.t0 + m.dur + 2.5
             self._seq_i += 1
             if self._seq_i >= len(seq):
                 self._seq_i, self._seq = 0, self._seq + 1
                 self._next += float(self.rng.uniform(9, 20))
+        self._ais_update()
+        if self.t >= self._cw_next:
+            self._cw_next = self.t + 1.0
+            self._collision_watch()
+
+    # ---------------------------------------------------------------- AIS
+    def _ais_update(self):
+        live = set()
+        for c in self.contacts:
+            if not (c.ais and c.active):
+                continue
+            live.add(c.mmsi)
+            if self.t >= self._ais_next.get(c.mmsi, 0.0):
+                self.ais[c.mmsi] = dict(name=c.name, mmsi=c.mmsi, cs=c.cs, x=c.x, y=c.y, cog=c.cog, sog=c.sog,
+                                        t=self.t, cls=c.ais_class, c=c, length=c.length)
+                iv = 30.0 if c.ais_class == "B" else (10.0 if c.ais_class == "SAR" else
+                                                       (10.0 if c.sog < 14 else (6.0 if c.sog < 23 else 2.0)))
+                self._ais_next[c.mmsi] = self.t + iv * float(self.rng.uniform(0.85, 1.15))
+        d = self.ais_device
+        if d and d.get("on"):
+            live.add(d["mmsi"])
+            if self.t >= self._ais_next.get(d["mmsi"], 0.0):
+                self.ais[d["mmsi"]] = dict(name=d["label"], mmsi=d["mmsi"], cs="", x=d["x"], y=d["y"], cog=0.0,
+                                           sog=0.0, t=self.t, cls=d["kind"], c=None, length=0)
+                self._ais_next[d["mmsi"]] = self.t + 8.0           # SAR devices burst once a minute (shortened)
+        for k in list(self.ais):
+            if k not in live:
+                del self.ais[k]
+
+    def rain_here(self):
+        """Rain rate (mm/h) falling on own ship."""
+        best = 0.0
+        for cx, cy, rad, rate, _, _ in self.rain:
+            d2 = ((self.x - cx) ** 2 + (self.y - cy) ** 2) / (rad * rad)
+            best = max(best, rate * max(0.0, 1 - d2))
+        return best
+
+    def cpa(self, c, own_hdg=None, own_spd=None):
+        """(CPA nm, TCPA min, range nm, true bearing) of a contact."""
+        hd = self.hdg if own_hdg is None else own_hdg
+        sp = self.spd if own_spd is None else own_spd
+        a, b = math.radians(c.cog), math.radians(hd)
+        vx, vy = c.sog * math.sin(a) - sp * math.sin(b), c.sog * math.cos(a) - sp * math.cos(b)
+        dx, dy = c.x - self.x, c.y - self.y
+        v2 = vx * vx + vy * vy
+        tc = -(dx * vx + dy * vy) / v2 if v2 > 1e-6 else 0.0
+        rng = math.hypot(dx, dy)
+        cp = math.hypot(dx + vx * tc, dy + vy * tc) if tc > 0 else rng
+        return cp, tc * 60.0, rng, math.degrees(math.atan2(dx, dy)) % 360
+
+    def _collision_watch(self):
+        """A ship standing into close quarters with you calls you on CH16."""
+        if not self.radio_chatter:
+            return
+        for c in self.contacts:
+            if c.kind != "ship" or not c.active:
+                continue
+            cp, tc, rng, brg = self.cpa(c)
+            if cp < 0.5 and 0 < tc < 15 and rng < 8 and self.t - self._b2b.get(c.name, -1e9) > 480:
+                self._b2b[c.name] = self.t
+                rel = ((brg + 180) - c.cog) % 360            # where we are, seen from her bridge
+                txt = ("VESSEL ON MY %s, HEADING %s AT %d KNOTS, THIS IS %s, %s, ON CHANNEL 16. "
+                       "WE ARE CLOSING, RANGE %d MILES. WHAT ARE YOUR INTENTIONS? OVER."
+                       % (side_word(rel), compass_word(self.hdg), round(self.spd), c.name, c.name, max(1, round(rng))))
+                self.say(16, c, txt, 2.0)
+                self.b2b_call = dict(src=c, t=self.t, hdg0=self.hdg, answered=False)
+                return
+
+    def _home(self, c):
+        """SAR unit tasked to own ship: fly to it, then hold station overhead."""
+        dx, dy = self.x - c.x, self.y - c.y
+        d = math.hypot(dx, dy)
+        if d > 0.12:
+            c.cog = math.degrees(math.atan2(dx, dy)) % 360
+            c.sog = 110.0 if d > 1.5 else max(self.spd + 6.0, 110.0 * d / 1.5)
+        else:
+            c.cog, c.sog = self.hdg, self.spd
+            if not c.on_scene:
+                c.on_scene = True
+                self.events["on_scene:" + c.name] = self.t
+                self.say(16, c, "%s, THIS IS %s. ON SCENE, OVERHEAD YOUR STERN. KEEP YOUR COURSE INTO THE WIND, "
+                         "SPEED 5 KNOTS. PREPARE TO RECEIVE THE WINCHMAN ON YOUR PORT QUARTER. OVER." % (self.name, c.name), 1.5)
+
+    def task_sar(self, c, rng=16.0, brg=35.0):
+        """Send a SAR unit to own ship from range/bearing."""
+        a = math.radians(brg)
+        c.x, c.y = self.x + rng * math.sin(a), self.y + rng * math.cos(a)
+        c.active, c.home, c.on_scene = True, True, False
+        c.sog = 110.0
 
     def say(self, ch, src, text, delay=0.0, kind="voice", dsc=None):
         """Queue a transmission. ch < 100 is a marine VHF channel, else MHz."""

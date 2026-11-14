@@ -9,7 +9,7 @@ from . import ui, fx
 from .ui import C, text, Knob, Selector, Button, Guard, Station
 from .world import INMARSAT, geo_look, fmt_lat, fmt_lon, wrap180
 from .worldmap import WorldMap
-from .radiocore import Monitor
+from .radiocore import Monitor, Voice
 from .vhf import NATURES
 
 SAC = {
@@ -20,19 +20,25 @@ SAC = {
     "42": ("NAVIGATIONAL HAZARDS", "NAVAREA CO-ORDINATOR: READY TO COPY YOUR HAZARD OR DERELICT REPORT."),
     "43": ("SHIP POSITION REPORTS", "POSITION REPORTING SERVICE: READY TO COPY (AMVER / AUSREP FORMAT)."),
 }
-EGC = [
-    "SAFETYNET  NAVAREA II WARNING 318/26. BAY OF BISCAY. DERELICT FISHING VESSEL ADRIFT 46-12N 007-40W. WIDE BERTH REQUESTED.",
-    "SAFETYNET  METAREA I HIGH SEAS FORECAST. SOLE, SHANNON: SOUTHWEST 7 TO SEVERE GALE 9, VERY ROUGH OR HIGH, RAIN, MODERATE OR POOR.",
-    "SAFETYNET  NAVAREA I WARNING 207/26. ENGLISH CHANNEL WESTERN APPROACHES. CABLE OPERATIONS IN PROGRESS BY CS RESOLUTE 49-20N 006-10W. 1 MILE BERTH.",
-    "SAFETYNET  SAR. MRCC REQUESTS VESSELS WITHIN 50 MILES OF 49-30N 006-00W TO REPORT. RED FLARES SIGHTED. KEEP SHARP LOOKOUT.",
-    "FLEETNET  COMPANY CIRCULAR 44. ALL MASTERS: BUNKER SAMPLING PROCEDURE REVISED, SEE SMS SECTION 7.",
+EGC = [  # (area: NAVAREA number, 0 = addressed to a circle round a position (always for ships inside), -1 = FleetNET)
+    (2, "SAFETYNET  NAVAREA II WARNING 318/26. BAY OF BISCAY. DERELICT FISHING VESSEL ADRIFT 46-12N 007-40W. WIDE BERTH REQUESTED."),
+    (1, "SAFETYNET  METAREA I HIGH SEAS FORECAST. SOLE, SHANNON: SOUTHWEST 7 TO SEVERE GALE 9, VERY ROUGH OR HIGH, RAIN, MODERATE OR POOR."),
+    (1, "SAFETYNET  NAVAREA I WARNING 207/26. ENGLISH CHANNEL WESTERN APPROACHES. CABLE OPERATIONS IN PROGRESS BY CS RESOLUTE 49-20N 006-10W. 1 MILE BERTH."),
+    (0, "SAFETYNET  SAR. MRCC REQUESTS VESSELS WITHIN 50 MILES OF 49-30N 006-00W TO REPORT. RED FLARES SIGHTED. KEEP SHARP LOOKOUT."),
+    (-1, "FLEETNET  COMPANY CIRCULAR 44. ALL MASTERS: BUNKER SAMPLING PROCEDURE REVISED, SEE SMS SECTION 7."),
+    (3, "SAFETYNET  NAVAREA III WARNING 112/26. WESTERN MEDITERRANEAN. NAVAL EXERCISES SOUTH OF SARDINIA, LIVE FIRING."),
 ]
+NAVAREAS = ["I", "II", "III", "IV"]
+SAC_VOICE = {"32": "RADIO MEDICAL SERVICE", "38": "MRCC PENHALE", "39": "MRCC PENHALE", "41": "MET OFFICE",
+             "42": "NAVAREA CO-ORDINATOR", "43": "POSITION REPORTING"}
 
 
 class Satcom(Station):
     name = "INMARSAT"
-    hint = ("Point the dish with AZIMUTH / ELEVATION until the signal peaks, engage AUTO TRACK, then "
-            "LOG IN. Type on the keyboard to write an Inmarsat-C message.")
+    hint = ("Point the dish with AZIMUTH / ELEVATION until the signal peaks (PEAK TONE helps), engage AUTO TRACK, "
+            "then LOG IN. Type on the keyboard to write an Inmarsat-C message.")
+    power_key = "SATC"
+    pan, bg_pan = 0.0, 0.55
 
     def __init__(self, app):
         super().__init__(app)
@@ -48,6 +54,9 @@ class Satcom(Station):
         self.dial, self.call = "", None
         self.next_egc = 25.0
         self.distress = None
+        self.voice = Voice("phone")
+        self.egc_i, self.navarea_i = 0, 0
+        self._locked, self._satc, self._fleet = False, True, True
         self.az = self.add(Knob(330, 622, 24, "AZIMUTH (TRUE)", 0, 360, 90, "Antenna azimuth, degrees true. "
             "The above-deck unit steers RELATIVE to the bow, so heading changes move it too.",
             wrap=True, step=0.5, fmt=lambda v: "%05.1f°" % v))
@@ -80,6 +89,18 @@ class Satcom(Station):
                               "assistance, 39 maritime assistance, 41 met reports, 42 navigational hazards. Dial then CALL.")
         self.b_call = self.add(Button((1300, 482, 62, 34), "CALL", "Place the voice call through the directional antenna.", color="green"))
         self.b_end = self.add(Button((1368, 482, 62, 34), "END", "Clear the call / the dialled digits.", color="red"))
+        self.b_peak = self.add(Button((300, 826, 130, 28), "PEAK TONE", "PEAK TONE: an audible pointing aid - the "
+            "beep rises in pitch and speeds up as the received signal (C/N0) improves. Turn AZIMUTH and ELEVATION "
+            "slowly for the highest note.", toggle=True, size=10))
+        self.b_pvt = self.add(Button((946, 350, 150, 30), "LINK TEST (PVT)", "PERFORMANCE VERIFICATION TEST: the "
+            "network checks the terminal's forward and return links and its distress alert path (no real alert is "
+            "sent). Needs the terminal logged in.", size=10))
+        self.b_area = self.add(Button((1102, 350, 150, 30), "EGC NAVAREA I", "EGC RECEIVER AREA: SafetyNET warnings "
+            "are addressed to NAVAREAs / METAREAs. Select the area you are in (this coast is NAVAREA I) or you will "
+            "miss the warnings meant for you.", size=10))
+        self.b_msi = self.add(Button((1258, 350, 150, 30), "PRINT: ALL EGC", "EGC printing: ALL EGC, or MSI ONLY "
+            "(SafetyNET maritime safety information, suppressing FleetNET commercial messages).", toggle=False, size=10))
+        self.msi_only = False
 
     def after(self, delay, fn):
         self.pending.append((self.world.t + delay, fn))
@@ -99,14 +120,18 @@ class Satcom(Station):
     # --------------------------------------------------------------- events
     def handle(self, ev):
         if ev.type == pygame.KEYDOWN and not (ev.mod & pygame.KMOD_CTRL):
+            snd = ("type", "type2", "type3")[(ev.key * 7) % 3]
             if ev.key == pygame.K_BACKSPACE:
                 self.msg = self.msg[:-1]
+                ui.sfx("type2", 0.6, pan=0.5)
                 return True
             if ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 self.msg += "\n"
+                ui.sfx("type3", 0.8, pan=0.5)
                 return True
             if ev.unicode and ev.unicode.isprintable() and len(self.msg) < 420:
                 self.msg += ev.unicode.upper()
+                ui.sfx(snd, 0.65, pan=0.5)
                 return True
         if super().handle(ev):
             return True
@@ -128,6 +153,23 @@ class Satcom(Station):
                 self.pending.remove(item)
                 item[1]()
         az, el, slant = self.look()
+        satc, fleet = self.app.powered("SATC"), self.app.powered("FLEET")
+        if satc != self._satc:
+            self._satc = satc
+            if not satc:
+                if self.logged:
+                    self.mon.note(w.utc_str(), "INMARSAT-C TERMINAL POWER LOST - LOGGED OUT.", C["red"])
+                self.logged, self.busy = None, None
+            else:
+                self.mon.note(w.utc_str(), "INMARSAT-C TERMINAL RESTARTED. LOG IN AGAIN.", C["amber"])
+        if fleet != self._fleet:
+            self._fleet = fleet
+            if not fleet:
+                self.b_auto.on = self.tracking = False
+                if self.call:
+                    self.call = None
+                    self.voice.text = None
+                    self.mon.note(w.utc_str(), "FLEET ABOVE-DECK UNIT POWER LOST - CALL DROPPED.", C["red"])
         if (self.az.val, self.el.val) != self._lastp:
             self._lastp, self._slew = (self.az.val, self.el.val), w.t + 0.25
         if self.region.value != getattr(self, "_reg", None):
@@ -146,13 +188,24 @@ class Satcom(Station):
             cn0 -= (5 - el) * 5
         if self.blocked:
             cn0 -= 25
-        self.cn0 = max(0.0, cn0)
+        self.cn0 = max(0.0, cn0) if fleet else 0.0
+        if self.cn0 > 46 and not self._locked:
+            self._locked = True
+            ui.sfx("lock", 0.6, pan=-0.4 if self.app.station is self else self.bg_pan)
+        elif self.cn0 < 40 and self._locked:
+            self._locked = False
+            ui.sfx("unlock", 0.6, pan=-0.4 if self.app.station is self else self.bg_pan)
         if self.b_auto.pop():
             if self.b_auto.on and self.cn0 < 44:
                 self.b_auto.on = False
                 self.mon.note(w.utc_str(), "AUTO TRACK REFUSED - NO SIGNAL LOCK (C/N0 %.0f dB-Hz). PEAK THE SIGNAL MANUALLY FIRST." % self.cn0, C["red"])
             elif self.b_auto.on:
                 self.flags["tracking"] = w.t
+        nav = getattr(self.app, "nav", None)
+        if self.b_auto.on and nav is not None and not nav.gyro_ok:
+            self.b_auto.on = False
+            self.mon.note(w.utc_str(), "AUTO TRACK LOST - NO GYRO HEADING: THE DISH CANNOT STABILISE AS THE SHIP TURNS.", C["red"])
+            self.mistake("Fleet dish auto-track needs a gyro heading - check the NAV / AIS tab.")
         self.tracking = self.b_auto.on
         if self.tracking:
             if el < 3:
@@ -161,8 +214,32 @@ class Satcom(Station):
                 self.az.set(round(az * 2) / 2 % 360)
                 self.el.set(max(0, round(el * 2) / 2))
         # Inmarsat-C
+        if self.b_area.pop():
+            self.navarea_i = (self.navarea_i + 1) % len(NAVAREAS)
+        self.b_area.label = "EGC NAVAREA " + NAVAREAS[self.navarea_i]
+        if self.b_msi.pop():
+            self.msi_only = not self.msi_only
+        self.b_msi.label = "PRINT: MSI ONLY" if self.msi_only else "PRINT: ALL EGC"
+        if self.b_pvt.pop() and not self.busy:
+            if not (self.logged and satc):
+                ui.sfx("error", 0.6)
+                self.mon.note(w.utc_str(), "PV TEST REFUSED - TERMINAL NOT LOGGED IN.", C["red"])
+            else:
+                self.busy = ("PV TEST WITH NCS %s" % self.logged, w.t, 6.0)
+                ui.sfx("data", 0.6)
+
+                def pvt():
+                    self.busy = None
+                    self.flags["pvt"] = w.t
+                    self.mon.note(w.utc_str(), "PERFORMANCE VERIFICATION TEST PASSED: FORWARD LINK OK, RETURN LINK OK, "
+                                  "DISTRESS ALERT TEST OK (NOT FORWARDED TO AN RCC). TERMINAL FULLY OPERATIONAL.", C["green"])
+                    ui.sfx("chime", 0.6)
+                self.after(6.0, pvt)
         if self.b_log.pop() and not self.busy:
-            if self.logged:
+            if not satc:
+                ui.sfx("error", 0.6)
+                self.mon.note(w.utc_str(), "TERMINAL HAS NO POWER - CHECK THE INMARSAT-C BREAKER ON THE POWER TAB.", C["red"])
+            elif self.logged:
                 self.mon.note(w.utc_str(), "LOGGED OUT OF %s." % self.logged)
                 self.logged = None
             elif self.c_bars() < 1:
@@ -187,6 +264,7 @@ class Satcom(Station):
         self.b_pri.label = ("ROUTINE", "SAFETY", "URGENCY")[self.pri_i]
         if self.b_send.pop() and not self.busy:
             if not self.logged:
+                ui.sfx("error", 0.6)
                 self.mon.note(w.utc_str(), "CANNOT SEND - NOT LOGGED IN TO AN OCEAN REGION.", C["red"])
             elif not self.msg.strip():
                 self.mon.note(w.utc_str(), "CANNOT SEND - MESSAGE IS EMPTY. TYPE ON THE KEYBOARD.", C["red"])
@@ -211,18 +289,26 @@ class Satcom(Station):
         # EGC
         if self.logged and w.t > self.next_egc:
             self.next_egc = w.t + 45
-            i = int(w.t / 45) % len(EGC)
-            self.mon.note("%s  EGC RECEIVED VIA %s" % (w.utc_str(), self.logged), EGC[i], C["lcdfg"])
-            self.flags["egc"] = w.t
+            area, msg = EGC[self.egc_i % len(EGC)]
+            self.egc_i += 1
+            sel = self.navarea_i + 1
+            if area == 0 or area == sel or (area == -1 and not self.msi_only):
+                self.mon.note("%s  EGC RECEIVED VIA %s" % (w.utc_str(), self.logged), msg, C["lcdfg"])
+                self.flags["egc"] = w.t
+                if area == 1:
+                    self.flags["egc_navarea1"] = w.t
         # handset
         for k, b in self.keys.items():
             if b.pop() and len(self.dial) < 14 and not self.call:
                 self.dial += k
         if self.b_end.pop():
             self.dial, self.call = "", None
+            self.voice.text = None
         if self.b_call.pop() and self.dial and not self.call:
             if self.cn0 < 46:
+                ui.sfx("busy", 0.7)
                 self.mon.note(w.utc_str(), "CALL FAILED - NO SATELLITE LINK ON THE DIRECTIONAL ANTENNA (C/N0 %.0f dB-Hz, need 46)." % self.cn0, C["red"])
+                self.mistake("Inmarsat voice call attempted without a satellite lock on the Fleet dish.")
             else:
                 num = self.dial.rstrip("#")
                 self.call = "DIALLING"
@@ -236,11 +322,15 @@ class Satcom(Station):
                     self.flags["call:" + num] = w.t
                     if num in SAC:
                         self.mon.note("%s  VOICE  CODE %s  %s" % (w.utc_str(), num, SAC[num][0]), SAC[num][1], C["cyan"])
+                        self.voice.say(SAC[num][1], SAC_VOICE.get(num, "MRCC PENHALE"), w.t, 0.6)
                     else:
                         self.mon.note("%s  VOICE  %s" % (w.utc_str(), num), "RINGING... SUBSCRIBER ANSWERED. (ONE-WAY DELAY %.0f ms - PAUSE BEFORE REPLYING.)" % (slant / 299.79 * 2), C["cyan"])
+                        self.voice.say("PENHALE SHIPPING, OPERATIONS DESK. GOOD DAY CAPTAIN, GO AHEAD PLEASE.", "PENHALE SHIPPING", w.t, 0.6)
                 self.after(3, conn)
         if self.call and self.cn0 < 40:
             self.call = None
+            self.voice.text = None
+            ui.sfx("busy", 0.6)
             self.mon.note(w.utc_str(), "CALL DROPPED - SATELLITE LINK LOST.", C["red"])
 
     def _distress(self):
@@ -265,9 +355,23 @@ class Satcom(Station):
                           "MESSAGE GIVING FULL DETAILS. KEEP THE TERMINAL ON." % les, C["yellow"])
         self.after(6, ack)
 
+    def audio(self, syn, n):
+        out = None
+        if self.call == "CONNECTED":
+            v = self.voice.chunk(n, self.world.t, 1.0)
+            out = (syn.noise(n) * 0.01) if v is None else v + syn.noise(n) * 0.01
+        if self.b_peak.on and self.app.powered("FLEET"):
+            q = max(0.0, min(1.0, self.cn0 / 60.0))
+            t = syn._time(n)
+            rate = 1.5 + 9.0 * q ** 2
+            gate = ((t * rate) % 1) < (0.5 if q < 0.76 else 0.9)
+            tone = syn.osc("peak", 300.0 + 1400.0 * q ** 1.5, n) * gate * 0.14
+            out = tone if out is None else out + tone
+        return out
+
     def bg_audio(self, syn, n):
         out = None
-        if self.world.t < self._slew and self.app.station is self:          # antenna drive motors
+        if self.world.t < self._slew and self.app.station is self and self.app.powered("FLEET"):   # antenna drive motors
             out = syn.osc("dish", 210.0, n) * 0.02 + syn.rumble("dishn", n, 8) * 0.07
         d = self.distress
         if d and d["acked"] and self.world.t - d["t0"] < 9:
@@ -284,7 +388,7 @@ class Satcom(Station):
                     "arc from the sub-satellite point). The poles are outside Inmarsat coverage - that is Sea Area A4.")
         if pygame.Rect(30, 560, 250, 290).collidepoint(pos):
             return "SKY PLOT: centre = zenith, outer ring = horizon, top = true north. The cross is where the dish points; the grey wedge is the mast blockage astern."
-        if pygame.Rect(946, 80, 628, 300).collidepoint(pos):
+        if pygame.Rect(946, 80, 628, 262).collidepoint(pos):
             return "Inmarsat-C terminal (omnidirectional antenna, 600 bit/s store-and-forward). Type to edit the message."
         return ""
 
@@ -362,7 +466,7 @@ class Satcom(Station):
         ui.led(s, (640, 566), "green", self.cn0 > 46, "SIGNAL LOCK", 5)
         ui.led(s, (760, 566), "red", self.blocked, "BLOCKAGE", 5)
         # Inmarsat-C screen
-        l = ui.lcd(s, (946, 80, 628, 300), (8, 12, 30))
+        l = ui.lcd(s, (946, 80, 628, 262), (8, 12, 30))
         fg = (150, 200, 255)
         bars = self.c_bars()
         text(s, "INMARSAT-C  MES 4%d  %s  %s" % (w.mmsi // 10, self.sat[0], ("LOGGED IN" if self.logged else "NOT LOGGED IN")),
@@ -382,7 +486,7 @@ class Satcom(Station):
             body = self.msg + ("_" if int(w.t * 2) % 2 else " ")
             if not self.msg:
                 text(s, "Type your message here...", (l.x + 10, l.y + 60), 13, (70, 90, 130))
-            ui.text_block(s, body, (l.x + 10, l.y + 60, l.w - 20, 200), 13, C["white"], lh=18)
+            ui.text_block(s, body, (l.x + 10, l.y + 60, l.w - 20, 160), 13, C["white"], lh=18)
         if self.busy:
             lab, t0, dur = self.busy
             f = min(1.0, (w.t - t0) / dur)

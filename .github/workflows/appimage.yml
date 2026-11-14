@@ -37,7 +37,10 @@ jobs:
           SDL_AUDIODRIVER: dummy
         run: |
           python tests/test_input.py
+          python tests/test_drills.py
+          python tests/test_features.py
           python run.py --selftest "$RUNNER_TEMP/source-shots"
+          test "$(find "$RUNNER_TEMP/source-shots" -maxdepth 1 -type f -name '*.png' | wc -l)" -eq 12
 
       - name: Freeze executable using PyInstaller
         run: |
@@ -115,7 +118,7 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
           ./RADAR-SIM-x86_64.AppImage --selftest "$RUNNER_TEMP/appimage-shots"
-          test "$(find "$RUNNER_TEMP/appimage-shots" -maxdepth 1 -type f -name '*.png' | wc -l)" -eq 8
+          test "$(find "$RUNNER_TEMP/appimage-shots" -maxdepth 1 -type f -name '*.png' | wc -l)" -eq 12
           sha256sum RADAR-SIM-x86_64.AppImage > RADAR-SIM-x86_64.AppImage.sha256
 
       - name: Upload downloadable AppImage

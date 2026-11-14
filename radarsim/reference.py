@@ -170,6 +170,68 @@ SART: test against your own X-band radar (rings on the PPI),
 carry it to the survival craft, mount it at least 1 m high.
 A false alert must be cancelled by telling an MRCC at once."""),
     ]),
+    ("AIS / NAVTEX / SENSORS", [
+        ("AIS", """Class A  12.5 W, reports every 10 s (0-14 kn), 6 s (14-23 kn),
+         2 s (over 23 kn), 3 min at anchor. Class B: about 30 s.
+MMSI     2xx-7xx ship   00x coast station   111 SAR aircraft
+         99x aid to navigation   970 AIS-SART   972 MOB device
+         974 EPIRB-AIS
+Limits   not every craft carries it; it lags the radar by the
+         reporting interval; positions come from the target's
+         GPS and can be wrong; it can be switched off (silent).
+         Radar is the primary collision-avoidance sensor."""),
+        ("RADAR ALARMS", """Guard zone   any echo painting inside the ring - clutter
+             too, so set STC / FTC sensibly
+Lost target  no echo for several scans: check the raw picture
+CPA / TCPA   steady bearing and closing range = risk
+Vectors      TRUE needs gyro + log; RELATIVE shows the risk"""),
+        ("NAVTEX", """518 kHz international (English), 490 kHz national,
+4209.5 kHz HF. Ground-wave range about 250-400 NM.
+ZCZC B1B2B3B4 ... NNNN
+B1  transmitter letter - select those covering your area
+B2  A nav warnings  B met warnings  C ice  D SAR / piracy
+    E forecasts  F pilot / VTS  G AIS  H LORAN  J GNSS
+    K other navaids  L nav warnings (additional to A)
+    A, B, D and L can NEVER be rejected
+B3B4 serial: not printed again once received cleanly,
+     except 00 (always printed)"""),
+        ("GPS AND GYRO", """GPS feeds DSC, Inmarsat-C and AIS. No fix = alerts carry
+'position unknown' unless you enter the position by hand:
+update a manual position at least every 4 hours.
+Datum: WGS84 for DSC, AIS and modern charts.
+Gyro speed error (deg) ~ 0.064 x V(kn) x cos(course)
+                         / cos(latitude)
+Set the gyro speed and latitude corrections to match the
+ship; check the gyro error by transit or azimuth."""),
+    ]),
+    ("POWER / SECURITY / IRIDIUM", [
+        ("GMDSS POWER", """Sources: main, emergency, and the RESERVE (radio battery).
+Reserve must run the radio installation for 1 hour, or 6 hours
+if there is no emergency generator. AC-only loads such as the
+radar and the Fleet dish are not on the battery.
+Daily    battery voltage on and off load, log it
+Weekly   DSC test call; check the emergency generator runs
+Monthly  EPIRB and SART self-tests, battery condition
+Earth fault: below about 1 MOhm insulation - find it before a
+second one causes a short circuit. Tripped breaker: OFF, then ON."""),
+        ("SSAS  (SOLAS XI-2/6)", """Covert alert to the company security officer and the
+flag state: NOTHING sounds or lights on board.
+Two activation points, one on the bridge. Protected
+against accidental use. Test only by prior arrangement
+with the CSO (TEST mode). A false alert: tell the CSO at
+once by phone with the code word."""),
+        ("LRIT  (SOLAS V/19-1)", """Automatic position reports to the flag state's data centre,
+normally every 6 hours; the centre can poll the ship or set a
+shorter interval. Only the flag administration may allow it
+to be switched off."""),
+        ("IRIDIUM AND FLEET BROADBAND", """Iridium: 66 satellites in six near-polar planes at 780 km,
+a GMDSS provider since 2020 - covers the polar regions (A4).
+The serving satellite changes every few minutes (handoff).
+Distress alert goes to the designated RCC, which calls back.
+Fleet Broadband: IP data and voice through the stabilised
+Inmarsat dish - no satellite lock, no data. Background IP is
+charged by the megabyte, streaming classes by the minute."""),
+    ]),
 ]
 
 
@@ -206,6 +268,9 @@ class Reference(Station):
                 text(s, ln, (x, y), 12, C["lcdfg"])
                 y += 17
             y += 16
-        ui.text_block(s, "KEYS\nF1-F8  stations\nF10  mute\nF11  full screen\nSPACE  push-to-talk\nWheel / drag  knobs\nSHIFT  fine adjust\n \nThis is a training aid with simplified physics. Always follow "
-                         "your flag state's rules and the equipment manuals at sea.", (36, 400, 210, 400), 11, C["dim"], mono=False, lh=17)
+        y0 = 84 + len(PAGES) * 50 + 14
+        ui.text_block(s, "KEYS\nF1-F12  stations\nCtrl+Tab  next station\nCtrl+M  mute\nCtrl+A  monitor all receivers\n"
+                         "PgUp / PgDn  volume\nCtrl+F  full screen\nSPACE  push-to-talk\nWheel / drag  knobs\nSHIFT  fine adjust\n \n"
+                         "This is a training aid with simplified physics. Always follow "
+                         "your flag state's rules and the equipment manuals at sea.", (36, y0, 210, 850 - y0), 11, C["dim"], mono=False, lh=16)
         super().draw(s)

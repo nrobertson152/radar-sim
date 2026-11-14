@@ -91,12 +91,17 @@ def text_block(s, msg, rect, size=13, color=None, lh=None, mono=True, bold=False
 
 
 GLASS = []                  # display faces drawn this frame, glazed in finish()
-SFX = None                  # set by the app: callable(name, volume)
+LIT = []                    # other self-lit faces (PPI) that stay bright when the panel lights are dimmed
+SFX = None                  # set by the app: callable(name, volume, pan)
 
 
-def sfx(name, vol=1.0):
+def sfx(name, vol=1.0, pan=None):
+    """Play a one-shot. Without an explicit pan it comes from wherever the
+    mouse is, i.e. from the control you just touched."""
     if SFX:
-        SFX(name, vol)
+        if pan is None:
+            pan = max(-1.0, min(1.0, MOUSE[0] / float(W) * 2.0 - 1.0)) * 0.8
+        SFX(name, vol, pan)
 
 
 def legend(s, msg, pos, size=10, color=(196, 200, 204), align="c", bold=True, mono=True):
@@ -140,6 +145,7 @@ def finish(s):
     for r, kind, gain in GLASS:
         fx.finish_glass(s, r, kind, gain)
     del GLASS[:]
+    del LIT[:]
 
 
 def _rgb(color):
@@ -230,11 +236,13 @@ class Knob(Widget):
         self._raw = val
         self.fmt, self.encoder, self.on_turn = fmt, encoder, on_turn
         self.drag, self.last, self.acc, self.spin, self._tick = False, (0, 0), 0.0, 0.0, 0.0
+        self._chg = -9999
 
     def set(self, v):
         self._raw = self.val = v
 
     def turn(self, frac, clicks=0.0):
+        self._chg = pygame.time.get_ticks()
         if self.encoder:
             self.acc += clicks
             n = int(self.acc)
@@ -319,6 +327,9 @@ class Knob(Widget):
         legend(s, self.label, (cx, cy + r + 12), 10)
         if self.fmt:
             text(s, self.fmt(self.val), (cx, cy - r - 27), 12, C["amber"], bold=True, align="c")
+        elif not self.encoder and (self.drag or pygame.time.get_ticks() - self._chg < 900):
+            f = (self.val - self.lo) / float(self.hi - self.lo)      # transient readout while turning
+            text(s, "%d%%" % round(f * 100), (cx, cy - r - 27), 12, C["amber"], bold=True, align="c")
 
 
 class Selector(Knob):
@@ -491,6 +502,144 @@ class Guard(Button):
             pygame.draw.rect(s, C["yellow"], r.inflate(4, 4), 1, border_radius=9)
 
 
+class Toggle(Widget):
+    """Bat-handle toggle switch (style 'bat') or moulded circuit breaker
+    (style 'breaker'). Click to flip. A tripped breaker must be pushed OFF
+    (first click resets it) before it can be switched ON again."""
+
+    def __init__(self, cx, cy, label, on=False, tip="", style="bat", up="ON", down="OFF", snd=None,
+                 on_change=None, guard=None):
+        super().__init__((cx - 17, cy - 26, 34, 52), label, tip)
+        self.cx, self.cy, self.on, self.style = cx, cy, bool(on), style
+        self.up, self.down = up, down
+        self.snd = snd or ("breaker" if style == "breaker" else "toggle")
+        self.on_change, self.guard = on_change, guard
+        self.tripped, self._changed = False, False
+
+    def pop(self):
+        c, self._changed = self._changed, False
+        return c
+
+    def set(self, on):
+        self.on, self.tripped = bool(on), False
+
+    def trip(self):
+        if self.on:
+            self.on, self.tripped = False, True
+            sfx(self.snd, 1.0, pan=(self.cx / float(W) * 2 - 1) * 0.8)
+
+    def flip(self):
+        if self.guard and not self.guard(self):
+            sfx("stop", 0.8)
+            return
+        if self.tripped:
+            self.tripped, self.on = False, False
+        else:
+            self.on = not self.on
+        self._changed = True
+        sfx(self.snd, 0.9)
+        if self.on_change:
+            self.on_change(self)
+
+    def click(self):
+        self.flip()
+
+    def handle(self, ev):
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button in (1, 3) and self.hit(ev.pos):
+            self.flip()
+            return True
+        return False
+
+    def draw(self, s):
+        sp = fx.toggle(self.on, self.style, self.tripped)
+        s.blit(sp, (self.cx - sp.get_width() // 2, self.cy - sp.get_height() // 2))
+        col_on = C["amber"] if self.on else (150, 152, 148)
+        col_off = C["amber"] if (not self.on and not self.tripped) else (150, 152, 148)
+        text(s, self.up, (self.cx, self.cy - 37), 9, col_on, bold=True, align="c")
+        text(s, "TRIP" if self.tripped else self.down, (self.cx, self.cy + 27), 9,
+             C["red"] if self.tripped else col_off, bold=True, align="c")
+        if self.label:
+            for i, ln in enumerate(self.label.split("\n")):
+                legend(s, ln, (self.cx, self.cy + 39 + i * 11), 9)
+        if self.hit(MOUSE):
+            pygame.draw.rect(s, C["amber"], self.rect.inflate(4, 4), 1, border_radius=5)
+
+
+class Thumbwheel(Widget):
+    """One digit of a thumbwheel switch. Click the upper half (or wheel up)
+    to step up, the lower half to step down."""
+
+    def __init__(self, x, y, symbols="0123456789", idx=0, tip="", w=20, h=34):
+        super().__init__((x, y, w, h), "", tip)
+        self.symbols, self.idx = symbols, idx
+
+    @property
+    def value(self):
+        return self.symbols[self.idx]
+
+    def set(self, ch):
+        if ch in self.symbols:
+            self.idx = self.symbols.index(ch)
+
+    def step(self, d):
+        self.idx = (self.idx + d) % len(self.symbols)
+        sfx("thumb", 0.8)
+
+    def handle(self, ev):
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button in (1, 3) and self.hit(ev.pos):
+            up = ev.pos[1] < self.rect.centery
+            self.step(1 if (up == (ev.button == 1)) else -1)
+            return True
+        if ev.type == pygame.MOUSEWHEEL and self.hit(MOUSE):
+            self.step(1 if ev.y > 0 else -1)
+            return True
+        return False
+
+    def draw(self, s):
+        r = self.rect
+        s.blit(fx.thumbwheel(r.w, r.h), r)
+        text(s, self.value, (r.centerx, r.centery), 15, (236, 236, 228), bold=True, align="m")
+        if self.hit(MOUSE):
+            pygame.draw.rect(s, C["amber"], r.inflate(2, 2), 1, border_radius=4)
+
+
+def thumbs(station, x, y, spec, tip="", w=20, h=34, gap=2):
+    """A row of thumbwheels. spec: string of initial characters; a symbol set
+    per position is chosen by character type (digit, N/S, E/W). '.' or ' '
+    in the spec leave a gap (a printed decimal point). Returns the list."""
+    out = []
+    for ch in spec:
+        if ch in ". ":
+            if ch == ".":
+                out.append(None)
+            x += 8
+            continue
+        sym = "NS" if ch in "NS" else ("EW" if ch in "EW" else "0123456789")
+        t = station.add(Thumbwheel(x, y, sym, sym.index(ch), tip, w, h))
+        out.append(t)
+        x += w + gap
+    return out
+
+
+def thumb_str(wheels):
+    return "".join("." if t is None else t.value for t in wheels)
+
+
+def annunciator(s, rect, label, color, on, size=9, flash=False):
+    """Back-lit legend window of an alarm / status annunciator panel."""
+    r = pygame.Rect(rect)
+    lit = bool(on) and (not flash or pygame.time.get_ticks() // 300 % 2 == 0)
+    col = _rgb(color)
+    if lit:
+        s.blit(fx.halo(r.w, r.h, col, 0.22, 12), (r.x - 12, r.y - 12), special_flags=pygame.BLEND_RGB_ADD)
+    s.blit(fx.button(r.w, r.h, col, lit, False), r)
+    lines = label.split("\n")
+    y = r.centery - (len(lines) - 1) * size * 0.6
+    for ln in lines:
+        text(s, ln, (r.centerx, y), size, (26, 16, 6) if lit else (130, 132, 128), bold=True, align="m")
+        y += size * 1.2
+
+
 def keypad(station, x, y, rows, w=44, h=34, gap=6, tip="Keypad", snd="key"):
     """Add a grid of buttons to a station; returns {label: Button}."""
     keys = {}
@@ -504,12 +653,29 @@ def keypad(station, x, y, rows, w=44, h=34, gap=6, tip="Keypad", snd="key"):
 
 class Station:
     """One equipment position (a tab). update() runs every frame for ALL
-    stations so the sim keeps going in the background."""
+    stations so the sim keeps going in the background.
+
+    pan / bg_pan place the station's sound on the console (in front of you
+    when selected, at its own position on the console otherwise); bg_listen
+    lets its receiver be heard from other tabs when MONITOR ALL is on.
+    power_key names its breaker on the POWER panel."""
     name = ""
+    tab = None
     hint = ""
+    pan, bg_pan, bg_listen, bg_level = 0.0, 0.0, False, 0.3
+    power_key = None
 
     def __init__(self, app):
         self.app, self.world, self.widgets, self.alert = app, app.world, [], False
+
+    @property
+    def powered(self):
+        return self.app.powered(self.power_key)
+
+    def mistake(self, msg):
+        f = getattr(self.app, "mistake", None)
+        if f:
+            f(msg)
 
     def add(self, w):
         self.widgets.append(w)
